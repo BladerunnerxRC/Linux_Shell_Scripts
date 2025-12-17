@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+# NEEDS to run as root!!
+
+echo "Checking phasing status for all upgradable packages..."
+echo
+
+# Get list of upgradable packages
+UPGRADABLE=$(apt list --upgradable 2>/dev/null | tail -n +2 | cut -d/ -f1)
+
+if [ -z "$UPGRADABLE" ]; then
+    echo "No upgradable packages found."
+    exit 0
+fi
+
+printf "%-30s %-20s %-20s %-10s\n" "PACKAGE" "INSTALLED" "CANDIDATE" "PHASING"
+printf "%-30s %-20s %-20s %-10s\n" "-------" "---------" "---------" "-------"
+
+for pkg in $UPGRADABLE; do
+    # Extract installed and candidate versions
+    installed=$(apt-cache policy "$pkg" | awk '/Installed:/ {print $2}')
+    candidate=$(apt-cache policy "$pkg" | awk '/Candidate:/ {print $2}')
+
+    # Extract phasing percentage (if present)
+    phasing=$(apt-cache policy "$pkg" | awk '/phasing/ {print $2}')
+
+    if [ -z "$phasing" ]; then
+        phasing="100%"
+    else
+        phasing="${phasing}%"
+    fi
+
+    printf "%-30s %-20s %-20s %-10s\n" "$pkg" "$installed" "$candidate" "$phasing"
+done
