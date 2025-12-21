@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# ANSI color codes
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+LOGFILE="/var/log/safe-shutdown.log"
+
+echo -e "${CYAN}=======================================${RESET}"
+echo -e "${CYAN}   SAFE SHUTDOWN: Gracefully stopping Docker${RESET}"
+echo -e "${CYAN}=======================================${RESET}"
+echo "$(date) - Safe shutdown initiated" | tee -a "$LOGFILE"
+
+# Trap Ctrl+C to clean up spinner output
+trap "printf '\nAborted by user.\n'; exit 1" INT
+
+# Check if Docker is running
+if ! systemctl is-active --quiet docker; then
+    echo -e "${RED}Docker is not running. Shutting down immediately.${RESET}"
+    echo "$(date) - Docker not running, shutting down immediately" >> "$LOGFILE"
+    poweroff
+fi
+
+# Get list of running containers
+CONTAINERS=$(docker ps --format "{{.ID}} {{.Names}}")
+
+if [ -z "$CONTAINERS" ]; then
+    echo -e "${YELLOW}No running containers found.${RESET}"
+    echo "$(date) - No containers running" >> "$LOGFILE"
+else
+    echo -e "${BLUE}Stopping containers:${RESET}"
+    echo "$CONTAINERS" | while read -r ID NAME; do
+        echo -e " - ${BOLD}${NAME}${RESET}"
+    done
+    echo ""
+
+    # Spinner function
+    spin() {
+        local chars="/-\|"
+        while kill -0 "$1" 2>/dev/null; do
+            for (( i=0; i<${#chars}; i++ )); do
+                printf "\r${YELLOW}Stopping containers... %c${RESET}" "${chars:$i:1}"
+                sleep 0.1
+            done
+        done
+        printf "\r${GREEN}Containers stopped.        ${RESET}\n"
+    }
+
+    # Stop containers with timeout
+    docker stop --time=20 $(echo "$CONTAINERS" | awk '{print $1}') >/dev/null 2>&1 &
+    STOP_PID=$!
+
+    spin $STOP_PID
+
+    echo "$(date) - Containers stopped" >> "$LOGFILE"
+fi
+
+# Verify all containers stopped
+if docker ps -q | grep -q .; then
+    echo -e "${RED}Warning: Some containers are still running.${RESET}"
+    echo "$(date) - Warning: Some containers still running" >> "$LOGFILE"
+else
+    echo -e "${GREEN}All containers stopped successfully.${RESET}"
+fi
+
+echo -e "${CYAN}Shutting down system now...${RESET}"
+echo "$(date) - System shutting down" >> "$LOGFILE"
+sleep 1
+poweroff
