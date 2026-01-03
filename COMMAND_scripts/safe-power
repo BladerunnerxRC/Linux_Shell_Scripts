@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# =====================================================================
+#  safe-power
+#  ---------------------------------------------------------------------
+#  A system-grade shutdown/reboot wrapper that ensures Docker workloads
+#  are stopped cleanly before the host powers off. The script integrates
+#  with systemd inhibitor locks to prevent race conditions between
+#  container shutdown and system shutdown.
+#
+#  Key Features:
+#    • Graceful Docker container stop with configurable timeout
+#    • systemd-inhibit lock to block shutdown until cleanup completes
+#    • Structured journald logging via `logger`
+#    • Interactive or automated operation (confirmation flags)
+#    • Dry-run mode for safe testing
+#    • Colorized terminal output (optional)
+#
+#  Intended Use:
+#    Install as /usr/local/bin/safe-power and invoke manually or from
+#    automation. Must be run as root or via sudo.
+#
+#  Author: Thomas
+#  Version: 1.0
+# =====================================================================
+
+set -euo pipefail
+
+# ---------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------
+DRYRUN=false
+FORCE=false
+NOCONFIRM=false
+ACTION=""
+TIMEOUT=20
+USE_COLOR=true
+
+# ---------------------------------------------------------
+# ANSI colors (can be disabled with --no-color)
+# ---------------------------------------------------------
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+disable_colors() {
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; RESET=""
+}
+
+# ---------------------------------------------------------
+# Usage / Help
+# ---------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: safe-power [reboot|shutdown] [options]
+
+Actions:
+  reboot          Reboot the system
+  shutdown        Power off the system
+
+Options:
+  --dryrun        Show actions without executing them
+  --force         Skip Docker entirely and reboot/shutdown immediately
+  --timeout=N     Timeout (seconds) for docker stop (default: 20)
+  --no-color      Disable ANSI color output
+  --noconfirm     Skip the confirmation prompt
+EOF
+    exit 1
+}
+
+# ---------------------------------------------------------
+# Argument Parsing
+# ---------------------------------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        reboot|shutdown)
+            ACTION="$arg"
+            ;;
+        --dryrun)
+            DRYRUN=true
+            ;;
+        --force)
+            FORCE=true
+            ;;
+        --noconfirm)
+            NOCONFIRM=true
+            ;;
+        --no-color)
+            USE_COLOR=false
+            ;;
+        --timeout=*)
+            TIMEOUT="${arg#*=}"
+            if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+                logger -p user.err -t safe-power "Invalid timeout: $TIMEOUT"
+                usage
+            fi
+            ;;
+        *)
+            logger -p user.err -t safe-power "Unknown argument: $arg"
+            usage
+            ;;
+    esac
+done
+
+[ "$USE_COLOR" = false ] && disable_colors
+[ -z "$ACTION" ] && usage
+
+# ---------------------------------------------------------
+# Confirmation Prompt
+# ---------------------------------------------------------
+confirm_action() {
+    if $NOCONFIRM || $DRYRUN; then
+        return 0
+    fi
+
+    echo -ne "${YELLOW}Proceed with $ACTION? [Y/n]: ${RESET}"
+    read -r REPLY
+
+    case "$REPLY" in
+        ""|y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            logger -p user.warning -t safe-power "Cancelled by user"
+            exit 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------
+# Main Logic
+# ---------------------------------------------------------
+main() {
+    logger -p user.info -t safe-power \
+        "Invoked: action=$ACTION dryrun=$DRYRUN force=$FORCE timeout=$TIMEOUT"
+
+    confirm_action
+
+    if $FORCE; then
+        logger -p user.warning -t safe-power "[FORCE] Skipping Docker container stop"
+        $DRYRUN && return 0
+        [ "$ACTION" = "reboot" ] && reboot || poweroff
+    fi
+
+    if systemctl is-active --quiet docker && command -v docker >/dev/null 2>&1; then
+        CONTAINERS=$(docker ps -q)
+
+        if [ -n "$CONTAINERS" ]; then
+            if ! $DRYRUN; then
+                logger -p user.info -t safe-power \
+                    "Stopping containers with timeout=$TIMEOUT"
+                docker stop --time="$TIMEOUT" $CONTAINERS >/dev/null 2>&1 || \
+                    logger -p user.err -t safe-power "docker stop encountered errors"
+                logger -p user.info -t safe-power "Containers stopped"
+            else
+                logger -p user.info -t safe-power \
+                    "[DRYRUN] Would stop containers: $CONTAINERS"
+            fi
+        else
+            logger -p user.info -t safe-power "No running containers to stop"
+        fi
+    else
+        logger -p user.info -t safe-power \
+            "Docker not active or not installed; skipping container stop"
+    fi
+
+    $DRYRUN && return 0
+
+    [ "$ACTION" = "reboot" ] && reboot || poweroff
+}
+
+# ---------------------------------------------------------
+# systemd Inhibitor Wrapper (Option B)
+# ---------------------------------------------------------
+export -f main
+
+systemd-inhibit \
+  --what=shutdown:reboot \
+  --who="safe-power" \
+  --why="Gracefully stopping Docker containers" \
+  --mode=block \
+  bash -c 'main "$@"' _ "$@"
