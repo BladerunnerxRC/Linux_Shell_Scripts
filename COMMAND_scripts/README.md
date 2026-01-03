@@ -49,5 +49,30 @@ Features added incrementally:
 
 ---
 
+# Install
+
+```bash
+sudo cp safe-power /usr/local/bin/safe-power
+sudo chmod 755 /usr/local/bin/safe-power
+```
+
+---
+
+# (optional) Install man page
+
+```bash
+sudo install -d /usr/local/share/man/man1
+sudo install -m 0644 safe-power.1 /usr/local/share/man/man1/
+sudo gzip -f /usr/local/share/man/man1/safe-power.1
+sudo mandb
+man safe-power
+```
+
+---
+
+
+
+
+
 
 
