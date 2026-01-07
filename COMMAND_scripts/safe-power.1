@@ -1,0 +1,93 @@
+.TH SAFE-POWER 1 "2026-01-06" "safe-power 1.0.0" "User Commands"
+.SH NAME
+safe-power \- safely reboot or shut down a Linux system running Docker workloads
+.SH SYNOPSIS
+.B safe-power
+.RB [ reboot | shutdown ]
+.RI [ options ]
+.SH DESCRIPTION
+.B safe-power
+is a system-grade command-line utility designed to safely reboot or shut down a Linux host running Docker workloads.
+
+Before initiating a reboot or power-off,
+.B safe-power
+ensures that running Docker containers are stopped cleanly. It integrates with
+.BR systemd-inhibit (1)
+to prevent shutdown/reboot from completing until container cleanup has finished, reducing race conditions and the risk of data corruption.
+
+All actions are logged to journald using
+.BR logger (1)
+under the tag
+.BR safe-power .
+.SH ACTIONS
+.TP
+.B reboot
+Reboot the system after stopping Docker containers.
+.TP
+.B shutdown
+Power off the system after stopping Docker containers.
+.SH OPTIONS
+.TP
+.BR --dryrun
+Display the actions that would be performed without executing them. No reboot/shutdown occurs.
+.TP
+.BR --force
+Skip Docker container shutdown entirely and immediately reboot or shut down.
+.TP
+.BI --timeout= N
+Specify the timeout in seconds passed to
+.BR docker\ stop .
+Default is 20 seconds.
+.TP
+.BR --no-color
+Disable ANSI color output.
+.TP
+.BR --noconfirm
+Skip the interactive confirmation prompt.
+.TP
+.BR --verbose
+Enable human-readable output (additional informational messages).
+.TP
+.BR --version
+Print the program version and exit.
+.SH LOGGING
+All events are logged to journald under the tag
+.BR safe-power .
+
+Examples:
+.PP
+.nf
+journalctl -t safe-power
+journalctl -t safe-power -b
+.fi
+.SH SYSTEMD INHIBITOR LOCK
+.B safe-power
+uses
+.B systemd-inhibit --mode=block
+to prevent shutdown or reboot from completing until the script exits.
+
+This guarantees that Docker container cleanup is not interrupted by external shutdown triggers (for example, shutdown initiated from a desktop session or remote management).
+.SH EXIT STATUS
+.TP
+.B 0
+Successful execution (or successful dry-run).
+.TP
+.B 1
+Invalid arguments, user cancellation, or execution error.
+.SH FILES
+.TP
+.I /usr/local/bin/safe-power
+Main executable.
+.TP
+.I /usr/local/share/man/man1/safe-power.1
+Manual page source.
+.SH COMPATIBILITY
+Ubuntu Server 24.04 LTS, Raspberry Pi OS (Debian-based), and other systemd-based Linux distributions.
+.SH AUTHOR
+Thomas
+.SH SEE ALSO
+.BR docker (1),
+.BR systemd-inhibit (1),
+.BR journalctl (1),
+.BR reboot (8),
+.BR poweroff (8)
