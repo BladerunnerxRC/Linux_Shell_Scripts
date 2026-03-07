@@ -11,16 +11,26 @@ sudo cp /etc/snmp/snmpd.conf /etc/snmp/snmpd.conf.bak.$(date +%s)
 
 # 3) Minimal LibreNMS-friendly config
 sudo tee /etc/snmp/snmpd.conf >/dev/null << 'EOF'
+###############################################################################
+# SNMP daemon config for optiplex-two (LibreNMS)  snmpd.conf
+###############################################################################
+
+# Listen on all IPv4 addresses on UDP/161
 agentAddress udp:161
+
+# Read-only community "homelab" allowed from your LAN
+# Change 192.168.200.0/24 if your subnet is different
 rocommunity homelab 192.168.200.14
 
+# Info displayed in LibreNMS
 sysLocation Homelab
 sysContact Thomas <[email protected]>
 sysName optiplex-two
+###############################################################################
 EOF
 
 # 4) (Optional) UFW firewall rule
-sudo ufw allow 161/udp 2>/dev/null || true
+# sudo ufw allow 161/udp 2>/dev/null || true
 
 # 5) Restart SNMP daemon
 sudo systemctl restart snmpd
