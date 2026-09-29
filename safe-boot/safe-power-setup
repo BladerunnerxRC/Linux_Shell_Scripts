@@ -1,0 +1,356 @@
+#!/bin/bash
+# safe-power-setup — one-time (re-runnable) setup of safe-power on every node
+#
+# Run from ANY node as your normal admin user (needs SSH + sudo to each node):
+#   ./safe-power-setup optiplex-docker optiplex-two optiplex-three
+#   ./safe-power-setup                   # re-run using NODES from cluster.conf
+#   ./safe-power-setup --verify          # only run the checks
+#
+# Options:
+#   --control-plane HOST   Kubernetes control plane      (default: optiplex-docker)
+#   --admin USER           SSH user for the bootstrap    (default: you)
+#   --user NAME            service account name          (default: safepower)
+#   --api-server URL       API URL workers should use    (default: from admin kubeconfig)
+#
+# On every node it:
+#   1. installs safe-power + safe-power-setup to /usr/local/sbin
+#   2. writes /etc/safe-power/cluster.conf (same on all nodes)
+#   3. creates the locked system account 'safepower' with a passphrase-less
+#      ed25519 key
+#   4. adds /etc/sudoers.d/safe-power: safepower may run ONLY safe-power as root
+#   5. trusts every node's key (authorized_keys, restricted to the safe-power
+#      SSH gate) and pins every node's host key (known_hosts)
+#   6. installs /etc/safe-power/kubeconfig for a Kubernetes ServiceAccount
+#      with just the rights kubectl drain / uncordon need
+
+set -uo pipefail
+
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+CONF_DIR="/etc/safe-power"
+
+if [ -t 1 ]; then
+  RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' CYN=$'\e[36m' BLD=$'\e[1m' RST=$'\e[0m'
+else
+  RED="" GRN="" YLW="" BLU="" CYN="" BLD="" RST=""
+fi
+step() { echo; echo "${CYN}${BLD}▶ $*${RST}"; }
+info() { echo "  ${BLU}•${RST} $*"; }
+ok()   { echo "  ${GRN}✔${RST} $*"; }
+warn() { echo "  ${YLW}⚠${RST} $*"; }
+die()  { echo "  ${RED}✘ $*${RST}" >&2; exit 1; }
+usage() { sed -n '2,25p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ============================================================ node-local steps
+# These run as root ON each node (invoked by the orchestrator below).
+
+node_init() {   # STAGE_DIR — install files, service account, key, sudoers
+  local stage=$1
+  # shellcheck source=/dev/null
+  . "$stage/cluster.conf"
+  local u="$SVC_USER" home key
+
+  install -m 755 "$stage/safe-power"       /usr/local/sbin/safe-power
+  install -m 755 "$stage/safe-power-setup" /usr/local/sbin/safe-power-setup
+  install -d -m 755 "$CONF_DIR"
+  install -m 644 "$stage/cluster.conf" "$CONF_DIR/cluster.conf"
+  ok "installed safe-power, safe-power-setup, cluster.conf"
+
+  if ! id "$u" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir "/home/$u" --shell /bin/bash \
+            --comment "safe-power service account" "$u" || die "useradd failed"
+    ok "created system account $u"
+  else
+    ok "account $u exists"
+  fi
+  passwd -l "$u" >/dev/null 2>&1   # no password logins, key only
+  home=$(getent passwd "$u" | cut -d: -f6)
+  install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
+  key="$home/.ssh/id_ed25519"
+  if [ ! -f "$key" ]; then
+    sudo -u "$u" ssh-keygen -q -t ed25519 -N "" -C "$u@$(hostname -s)" -f "$key" || die "ssh-keygen failed"
+    ok "generated passphrase-less key $key"
+  else
+    ok "key $key exists"
+  fi
+  install -m 644 "$key.pub" "$CONF_DIR/$u.pub"
+
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+# safe-power service account: may run only safe-power as root, nothing else.
+$u ALL=(root) NOPASSWD: /usr/local/sbin/safe-power
+Defaults:$u !requiretty
+EOF
+  if visudo -cqf "$tmp"; then
+    install -m 440 "$tmp" /etc/sudoers.d/safe-power; ok "sudoers rule installed"
+  else
+    rm -f "$tmp"; die "sudoers validation failed"
+  fi
+  rm -f "$tmp"
+
+  if command -v sshd >/dev/null && sshd -T 2>/dev/null | grep -qiE '^(allowusers|allowgroups) '; then
+    warn "sshd has AllowUsers/AllowGroups set — add '$u' or SSH between nodes will be refused"
+  fi
+}
+
+node_keys() {   # STAGE_DIR — install authorized_keys / known_hosts / kubeconfig
+  local stage=$1
+  # shellcheck source=/dev/null
+  . "$CONF_DIR/cluster.conf"
+  local u="$SVC_USER" home
+  home=$(getent passwd "$u" | cut -d: -f6)
+  install -m 600 -o "$u" -g "$u" "$stage/authorized_keys" "$home/.ssh/authorized_keys"
+  install -m 644 -o "$u" -g "$u" "$stage/known_hosts"     "$home/.ssh/known_hosts"
+  ok "authorized_keys + known_hosts installed"
+  if [ -f "$stage/kubeconfig" ]; then
+    install -m 640 -o root -g "$u" "$stage/kubeconfig" "$CONF_DIR/kubeconfig"
+    ok "kubeconfig installed ($CONF_DIR/kubeconfig)"
+  fi
+  rm -rf "$stage"
+}
+
+node_k8s() {    # STAGE_DIR OWNER [API_URL] — create k8s ServiceAccount + kubeconfig (control plane)
+  local stage=$1 owner=$2 api=${3:-} cfg admin="" ns="kube-system"
+  local -a K
+  if command -v kubectl >/dev/null; then K=(kubectl)
+  elif command -v k3s >/dev/null; then K=(k3s kubectl)
+  else warn "kubectl not found — skipping Kubernetes setup"; return 0; fi
+
+  for cfg in "${KUBECONFIG:-}" /etc/kubernetes/admin.conf /etc/rancher/k3s/k3s.yaml /root/.kube/config \
+             "$(getent passwd "$owner" | cut -d: -f6)/.kube/config"; do
+    [ -n "$cfg" ] && [ -r "$cfg" ] || continue
+    KUBECONFIG="$cfg" "${K[@]}" get ns "$ns" >/dev/null 2>&1 && { admin=$cfg; break; }
+  done
+  [ -n "$admin" ] || { warn "no working admin kubeconfig — skipping Kubernetes setup"; return 0; }
+  k() { KUBECONFIG="$admin" "${K[@]}" "$@"; }
+  info "admin kubeconfig: $admin"
+
+  k apply -f - >/dev/null <<'EOF' || die "kubectl apply failed"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: safe-power
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: safe-power-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: safe-power
+type: kubernetes.io/service-account-token
+---
+# Exactly what `kubectl drain` / `cordon` / `uncordon` need
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: safe-power
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["replicationcontrollers"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: safe-power
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: safe-power
+subjects:
+  - kind: ServiceAccount
+    name: safe-power
+    namespace: kube-system
+EOF
+  ok "ServiceAccount, ClusterRole, ClusterRoleBinding 'safe-power' applied"
+
+  local token="" i
+  for i in $(seq 1 30); do
+    token=$(k -n "$ns" get secret safe-power-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)
+    [ -n "$token" ] && break; sleep 1
+  done
+  [ -n "$token" ] || die "token for safe-power ServiceAccount never populated"
+
+  if [ -z "$api" ]; then
+    api=$(k config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    # a loopback URL (k3s default) is useless from workers
+    api=$(sed -E "s#//(127\.0\.0\.1|localhost|\[::1\])#//$(hostname -s)#" <<<"$api")
+  fi
+  local ca; ca=$(mktemp)
+  k -n "$ns" get secret safe-power-token -o jsonpath='{.data.ca\.crt}' | base64 -d > "$ca"
+
+  local out="$stage/kubeconfig"
+  k config --kubeconfig="$out" set-cluster optiplex --server="$api" \
+      --certificate-authority="$ca" --embed-certs=true >/dev/null
+  k config --kubeconfig="$out" set-credentials safe-power --token="$token" >/dev/null
+  k config --kubeconfig="$out" set-context safe-power --cluster=optiplex --user=safe-power >/dev/null
+  k config --kubeconfig="$out" use-context safe-power >/dev/null
+  rm -f "$ca"
+  chown "$owner" "$out"; chmod 600 "$out"
+
+  if KUBECONFIG="$out" "${K[@]}" auth can-i patch nodes >/dev/null 2>&1; then
+    ok "kubeconfig built (API $api) — can patch nodes"
+  else
+    warn "kubeconfig built for $api but 'can-i patch nodes' failed — check the API URL (--api-server)"
+  fi
+}
+
+case "${1:-}" in
+  --node-init) node_init "$2"; exit ;;
+  --node-keys) node_keys "$2"; exit ;;
+  --node-k8s)  node_k8s "$2" "$3" "${4:-}"; exit ;;
+esac
+
+# ============================================================ orchestrator
+CONTROL_PLANE_HOST=""; ADMIN="${SUDO_USER:-$(id -un)}"; SVC_USER=""; API=""; VERIFY_ONLY=0
+NODES=()
+# shellcheck source=/dev/null
+[ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
+CLI_NODES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --control-plane) CONTROL_PLANE_HOST=$2; shift ;;
+    --admin)         ADMIN=$2; shift ;;
+    --user)          SVC_USER=$2; shift ;;
+    --api-server)    API=$2; shift ;;
+    --verify)        VERIFY_ONLY=1 ;;
+    -h|--help)       usage 0 ;;
+    -*) echo "Unknown option: $1" >&2; usage 2 ;;
+    *)  CLI_NODES+=("$1") ;;
+  esac
+  shift
+done
+[ ${#CLI_NODES[@]} -gt 0 ] && NODES=("${CLI_NODES[@]}")
+CONTROL_PLANE_HOST=${CONTROL_PLANE_HOST:-optiplex-docker}
+SVC_USER=${SVC_USER:-safepower}
+[[ " ${NODES[*]} " == *" $CONTROL_PLANE_HOST "* ]] || NODES=("$CONTROL_PLANE_HOST" "${NODES[@]}")
+[ ${#NODES[@]} -ge 1 ] || usage 2
+SELF=$(hostname -s)
+[ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ] && warn "Running as root: bootstrap SSH will be as root. Prefer your admin user."
+
+echo "${CYN}${BLD}safe-power-setup${RST}"
+info "nodes:         ${BLD}${NODES[*]}${RST}"
+info "control plane: ${BLD}$CONTROL_PLANE_HOST${RST}"
+info "service acct:  ${BLD}$SVC_USER${RST}   bootstrap as: ${BLD}$ADMIN${RST}   running on: ${BLD}$SELF${RST}"
+
+WORK=$(mktemp -d)
+CTL="$WORK/ctl"; mkdir -p "$CTL"
+SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$CTL/%h" -o ControlPersist=15m -o ConnectTimeout=10)
+cleanup() {
+  local n; for n in "${NODES[@]}"; do ssh "${SSH_OPTS[@]}" -O exit "$ADMIN@$n" 2>/dev/null; done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+is_self() { [ "$1" = "$SELF" ]; }
+rssh()    { local n=$1; shift; ssh "${SSH_OPTS[@]}" "$ADMIN@$n" "$@"; }
+# as_root NODE CMD... — sudo on the node (interactive password prompt is fine)
+as_root() { local n=$1; shift; if is_self "$n"; then sudo "$@"; else ssh "${SSH_OPTS[@]}" -t "$ADMIN@$n" sudo "$@"; fi; }
+# push NODE FILE... — copy files into that node's stage dir
+push()    { local n=$1; shift; if is_self "$n"; then cp "$@" "${STAGE[$n]}/"; else scp -q "${SSH_OPTS[@]}" "$@" "$ADMIN@$n:${STAGE[$n]}/"; fi; }
+fetch()   { local n=$1 src=$2 dst=$3; if is_self "$n"; then cp "$src" "$dst"; else scp -q "${SSH_OPTS[@]}" "$ADMIN@$n:$src" "$dst"; fi; }
+
+run_verify() {
+  step "Verify (every node → every node)"
+  local n f=0
+  for n in "${NODES[@]}"; do
+    if is_self "$n" || ! [[ " ${NODES[*]} " == *" $SELF "* ]]; then
+      as_root "$n" /usr/local/sbin/safe-power --check || f=$((f + 1))
+    else
+      sudo /usr/local/sbin/safe-power --check "$n" || f=$((f + 1))
+    fi
+  done
+  echo
+  if [ "$f" -eq 0 ]; then echo "${GRN}${BLD}✅ All nodes verified.${RST}"
+  else echo "${RED}${BLD}❌ $f node(s) failed checks.${RST}"; fi
+  return "$f"
+}
+
+if [ "$VERIFY_ONLY" -eq 1 ]; then run_verify; exit $?; fi
+
+for f in safe-power safe-power-setup; do
+  [ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f not found — run from the safe-boot folder"
+done
+
+# ---------------------------------------------------------------- 0. reachability
+step "Checking SSH/sudo reachability as $ADMIN (you may be prompted for passwords)"
+declare -A STAGE
+for n in "${NODES[@]}"; do
+  if is_self "$n"; then
+    STAGE[$n]=$(mktemp -d); ok "$n (this host)"
+  else
+    STAGE[$n]=$(rssh "$n" 'mktemp -d /tmp/safe-power-setup.XXXXXX') || die "can't SSH to $ADMIN@$n"
+    ok "$n"
+  fi
+done
+
+cat > "$WORK/cluster.conf" <<EOF
+# /etc/safe-power/cluster.conf — written by safe-power-setup on $(date '+%F %T') from $SELF
+# Identical on every node. Re-run safe-power-setup to change it.
+CONTROL_PLANE_HOST="$CONTROL_PLANE_HOST"
+NODES=(${NODES[*]})
+SVC_USER="$SVC_USER"
+EOF
+
+# ---------------------------------------------------------------- 1. account + key
+step "1/4  Service account, passphrase-less key, sudoers on every node"
+for n in "${NODES[@]}"; do
+  echo "  ${BLD}$n${RST}"
+  push "$n" "$SCRIPT_DIR/safe-power" "$SCRIPT_DIR/safe-power-setup" "$WORK/cluster.conf"
+  as_root "$n" bash "${STAGE[$n]}/safe-power-setup" --node-init "${STAGE[$n]}" || die "node setup failed on $n"
+done
+
+# ---------------------------------------------------------------- 2. trust
+step "2/4  Collecting public keys and host keys"
+: > "$WORK/authorized_keys"; : > "$WORK/known_hosts"
+for n in "${NODES[@]}"; do
+  pub=$(if is_self "$n"; then cat "$CONF_DIR/$SVC_USER.pub"; else rssh "$n" cat "$CONF_DIR/$SVC_USER.pub"; fi) \
+    || die "couldn't read key from $n"
+  echo "restrict,command=\"/usr/local/sbin/safe-power --ssh-gate\" $pub" >> "$WORK/authorized_keys"
+  ok "key from $n"
+  hk=$(ssh-keyscan -T 5 "$n" 2>/dev/null)
+  if [ -n "$hk" ]; then
+    echo "$hk" >> "$WORK/known_hosts"; ok "host key for $n"
+  else
+    die "ssh-keyscan $n failed"
+  fi
+done
+
+# ---------------------------------------------------------------- 3. kubernetes
+step "3/4  Kubernetes ServiceAccount + kubeconfig on $CONTROL_PLANE_HOST"
+as_root "$CONTROL_PLANE_HOST" bash "${STAGE[$CONTROL_PLANE_HOST]}/safe-power-setup" \
+  --node-k8s "${STAGE[$CONTROL_PLANE_HOST]}" "$ADMIN" "$API" || die "Kubernetes setup failed"
+if fetch "$CONTROL_PLANE_HOST" "${STAGE[$CONTROL_PLANE_HOST]}/kubeconfig" "$WORK/kubeconfig" 2>/dev/null; then
+  chmod 600 "$WORK/kubeconfig"
+else
+  warn "no kubeconfig produced — workers will fall back to kubectl over SSH on $CONTROL_PLANE_HOST"
+fi
+
+# ---------------------------------------------------------------- 4. distribute
+step "4/4  Installing trust + kubeconfig on every node"
+for n in "${NODES[@]}"; do
+  echo "  ${BLD}$n${RST}"
+  files=("$WORK/authorized_keys" "$WORK/known_hosts")
+  [ -f "$WORK/kubeconfig" ] && files+=("$WORK/kubeconfig")
+  push "$n" "${files[@]}"
+  as_root "$n" bash "${STAGE[$n]}/safe-power-setup" --node-keys "${STAGE[$n]}" || die "install failed on $n"
+done
+
+run_verify
