@@ -406,6 +406,7 @@ Options:
 .BI \-\-user " NAME" ,
 .BI \-\-api-server " URL" ,
 .BI \-\-ntfy " URL" ,
+.BI \-\-ntfy-token " TOKEN" ,
 .BI \-\-ha-webhook " URL" ,
 .BR \-\-no-from / \-\-from ,
 .BI \-\-from-extra " LIST" ,
@@ -460,8 +461,12 @@ Set the URLs cluster-wide with
 and
 .B \-\-ha-webhook
 .IR URL .
-Put tokens in
-.BR local.conf .
+.BR \-\-ntfy-token
+.IR TOKEN .
+These settings are kept in
+.BR /etc/safe-power/notify.conf ,
+which is root-only (0600) on every node, because a webhook URL or ntfy topic
+works like a password.
 .SH SECURITY
 The service account cannot open a shell. The SSH gate
 .RB ( "safe-power \-\-ssh-gate" )
@@ -549,8 +554,12 @@ State:
 Cluster layout. Identical on every node, and rewritten by
 .BR safe-power-setup .
 .TP
+.B /etc/safe-power/notify.conf
+Notification URLs and ntfy token (root-only, 0600). Rewritten by
+.BR safe-power-setup .
+.TP
 .B /etc/safe-power/local.conf
-Per-node overrides, for example
+Per-node overrides (root-only, 0600), for example
 .BR HEALTH_URLS ,
 .B BLOCKING_CONTAINERS
 or
