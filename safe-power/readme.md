@@ -62,6 +62,8 @@ safe-power-setup --verify         # re-check the setup any time
 | `--api-server URL` | from admin kubeconfig | API URL for workers to use (needed if the admin kubeconfig points at `127.0.0.1`) |
 | `--ntfy URL` | off | ntfy topic for notifications on every node (kept on re-run, `""` turns it off) |
 | `--ha-webhook URL` | off | Home Assistant webhook for notifications on every node (kept on re-run, `""` turns it off) |
+| `--no-from` / `--from` | on | Turn the per-key source-address limit off / on (kept on re-run) |
+| `--from-extra LIST` | | Extra addresses/CIDRs allowed for every key, e.g. a VPN range |
 | `--verify` | | Only run the checks |
 
 </details>
@@ -76,7 +78,7 @@ safe-power-setup --verify         # re-check the setup any time
 + /etc/safe-power/local.conf                  YOUR per-node overrides (created once, never overwritten)
 + user  safepower                             system account, password locked, key-only login
 + /home/safepower/.ssh/id_ed25519             passphrase-less key (unique per node)
-+ /home/safepower/.ssh/authorized_keys        every node's key, locked to the safe-power SSH gate
++ /home/safepower/.ssh/authorized_keys        every node's key, locked to the safe-power SSH gate AND to that node's IPs (from=)
 + /home/safepower/.ssh/known_hosts            every node's host key (no trust-on-first-use)
 + /etc/sudoers.d/safe-power                   safepower may run ONLY /usr/local/sbin/safe-power as root
 + /etc/safe-power/kubeconfig                  Kubernetes ServiceAccount token (root:safepower 0640)
@@ -109,7 +111,9 @@ safe-power --shutdown [NODE]    # ⏻  drain → power off → restore at next p
 safe-power --drain    [NODE]    # 🚰 drain only
 safe-power --restore  [NODE]    # ♻️  bring a drained node back (runs automatically on boot)
 safe-power --status   [NODE]    # 📊 drained / ok / failed
-safe-power --check    [NODE]    # 🩺 verify account, SSH trust, kubectl
+safe-power --check    [NODE]    # 🩺 verify account, SSH trust, kubectl, mounts
+safe-power --needs-reboot [NODE] # 🩺 yes/no: pending updates or a newer kernel?
+safe-power --cancel             # 🗑️  cancel runs scheduled with --at
 
 safe-power --reboot   --all     # 🔄 rolling reboot of the whole cluster
 safe-power --shutdown --all     # 🔌 power off the whole cluster (UPS / outage)
@@ -128,6 +132,8 @@ safe-power --check    --all     # 🩺 checks on every node
 | `--workers-only` | With `--all`: leave the control plane out |
 | `--max-time=MIN` | With `--reboot --all`: don't start another node after `MIN` minutes (default 240, `0` = no limit) |
 | `--allow-concurrent` | Skip the one-node-down lock ⚠️ |
+| `--if-needed` | With `--reboot`: only reboot nodes that need it |
+| `--at WHEN` | Run later instead of now: `03:00`, `"tomorrow 02:30"`, `"2026-10-03 04:00"` |
 
 `NODE` defaults to **this host**. It re-runs itself with `sudo`, so you can leave `sudo` off.
 
@@ -285,6 +291,44 @@ automation:
 
 Notifications never fail a run, and are never sent during `--dry-run`.
 
+### 🩺 Reboot only when needed: `--if-needed`
+
+```bash
+safe-power --needs-reboot --all             # who needs one?
+safe-power --reboot --all --if-needed       # rolling reboot of just those nodes
+```
+
+```diff
+  == Reboot needed? ==
+!   ● optiplex-docker      yes — updates need a reboot (linux-image-6.8.0-45 libc6)
++   ✔ optiplex-two         no
+!   ● optiplex-three       yes — kernel 6.8.0-45-generic installed, 6.8.0-40-generic running
+```
+
+A node **needs a reboot** when any of these is true:
+
+| Check | Distro |
+|---|---|
+| `/var/run/reboot-required` exists | Debian / Ubuntu (unattended-upgrades) |
+| `needs-restarting -r` says so | RHEL / Fedora / Rocky |
+| a newer `vmlinuz-*` is in `/boot` than the kernel running | any |
+
+### 🗓️ Schedule it: `--at`
+
+```bash
+safe-power --reboot --all --if-needed --at 03:00     # tonight, only nodes that need it
+safe-power --reboot optiplex-three --at "tomorrow 02:30"
+safe-power --status                                  # shows what's scheduled
+safe-power --cancel                                  # cancel it
+```
+
+- You confirm **now** (including the red warning for `--all`), and the scheduled run gets `-y`.
+- It runs as a one-shot systemd timer (`safe-power-at-*`) on the node where you typed it. A bare time that has already passed today means tomorrow.
+- Rebooting the scheduling node before then cancels the timer.
+
+> [!TIP]
+> **Hands-off patching.** Let `unattended-upgrades` install updates, and have a weekly cron job on any node run `safe-power --reboot --all --if-needed -y`. Only nodes with new kernels or libraries reboot, one at a time, and each one waits until the one before it is healthy.
+
 ---
 
 ## 🧭 What it does
@@ -375,6 +419,8 @@ labels:
 - 🔒 **One node down at a time:** refuses to drain while another node is cordoned or `NotReady`.
 - 🚨 A reboot or shutdown of the whole cluster (`--all`) shows a **blinking red warning** and needs a typed `yes`.
 - ⏱️ Rolling reboots have a **time limit** (`ROLL_MAX`, default 4 h).
+- 📂 After boot, **required mounts** (e.g. the NAS backup share) must be up **before** any container starts.
+- 🔑 Each node's SSH key only works **from that node's own IP addresses** (`from=`).
 - ⚠️ Warns before shutting down the control plane.
 - 🧹 The restore step is a one-shot systemd unit (`safe-power-restore.service`) that removes itself when it's done.
 
@@ -408,6 +454,7 @@ Every setting at the top of `safe-power` can be overridden in `local.conf`. For 
 ```bash
 # /etc/safe-power/local.conf on optiplex-docker
 HEALTH_URLS=("http://localhost:7171" "http://localhost:3000" "http://localhost:8080")
+REQUIRED_MOUNTS=("/mnt/nas_backups" "/mnt/restic-backups")   # must be up before containers start
 BLOCKING_CONTAINERS=("backup-job" "nightly-dump")
 BACKUP_WAIT=1800
 DB_STOP_TIMEOUT=180
@@ -422,6 +469,8 @@ DB_STOP_TIMEOUT=180
 | Container in the wrong tier | Add the label `safe-power.tier=1`, `2` or `3` |
 | `✘ ssh safepower → nodeX` | Run `safe-power-setup --verify`. Check that the hostname resolves, and check `AllowUsers` in `sshd_config` |
 | `✘ kubectl access` | Re-run setup with `--api-server https://<control-plane-ip>:6443` |
+| `❌ /mnt/… is NOT mounted` after boot | Check the NAS and `/etc/fstab`, then `mount /mnt/…` and `safe-power --restore` |
+| `✘ ssh safepower → nodeX` after a node's IP changed | Re-run `safe-power-setup`: the `from=` addresses are taken at setup time |
 | Node left cordoned after boot | `safe-power --status NODE`, check the log on that node, then `safe-power --restore NODE` |
 | Host key changed (node rebuilt) | Re-run `safe-power-setup` with all nodes |
 
@@ -431,10 +480,6 @@ DB_STOP_TIMEOUT=180
 
 | | Idea | Why |
 |---|---|---|
-| 🔑 | **`from="<node IPs>"`** on each `authorized_keys` entry | A copied `safepower` key is useless from any other machine |
-| 📂 | **Check the NFS backup mount** after restore | Otherwise `backup.sh` quietly writes to the local disk when the NAS mount is missing |
-| 🗓️ | **Maintenance window** (`--at 03:00`, via `systemd-run --on-calendar`) | Schedule a rolling reboot without cron |
-| 🩺 | **Pre-reboot kernel check**: skip the reboot if `/var/run/reboot-required` is absent (`--if-needed`) | Nightly `--all --if-needed` reboots only the nodes that need it |
 | 🧪 | **shellcheck + bats tests** in GitHub Actions | Catch regressions before they reach the cluster |
 | 📖 | **Merge the v1 `COMMAND_scripts/safe-power`** once smiddleware moves to v2 | One `safe-power` command on every host |
 

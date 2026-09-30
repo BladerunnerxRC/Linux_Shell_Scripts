@@ -13,6 +13,8 @@
 #   --api-server URL       API URL workers should use    (default: from admin kubeconfig)
 #   --ntfy URL             ntfy topic for notifications  (kept on re-run; "" = off)
 #   --ha-webhook URL       Home Assistant webhook URL    (kept on re-run; "" = off)
+#   --no-from / --from     turn the per-key source-address limit off / on (default on)
+#   --from-extra LIST      extra addresses/CIDRs allowed for every key (VPN, NAT)
 #
 # On every node it:
 #   1. installs safe-power + safe-power-setup to /usr/local/sbin, and the
@@ -22,7 +24,8 @@
 #      ed25519 key
 #   4. adds /etc/sudoers.d/safe-power: safepower may run ONLY safe-power as root
 #   5. trusts every node's key (authorized_keys, restricted to the safe-power
-#      SSH gate) and pins every node's host key (known_hosts)
+#      SSH gate and to that node's own IP addresses with from=) and pins
+#      every node's host key (known_hosts)
 #   6. installs /etc/safe-power/kubeconfig for a Kubernetes ServiceAccount
 #      with just the rights kubectl drain / uncordon need
 
@@ -89,6 +92,14 @@ EOF
     ok "key $key exists"
   fi
   install -m 644 "$key.pub" "$CONF_DIR/$u.pub"
+  # this node's addresses — other nodes accept its key only from these (from=)
+  if command -v ip >/dev/null; then
+    ip -o addr show scope global | awk '{sub(/\/.*/, "", $4); print $4}'
+  else
+    hostname -I 2>/dev/null | tr ' ' '\n'
+  fi | awk 'NF' | sort -u | paste -sd, - > "$CONF_DIR/$u.addrs"
+  chmod 644 "$CONF_DIR/$u.addrs"
+  ok "addresses: $(cat "$CONF_DIR/$u.addrs")"
 
   local tmp; tmp=$(mktemp)
   cat > "$tmp" <<EOF
@@ -235,7 +246,7 @@ esac
 
 # ============================================================ orchestrator
 CONTROL_PLANE_HOST=""; ADMIN="${SUDO_USER:-$(id -un)}"; SVC_USER=""; API=""; VERIFY_ONLY=0
-NODES=(); NOTIFY_NTFY_URL=""; NOTIFY_HA_WEBHOOK=""
+NODES=(); NOTIFY_NTFY_URL=""; NOTIFY_HA_WEBHOOK=""; SSH_FROM=1; SSH_FROM_EXTRA=""
 # shellcheck source=/dev/null
 [ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
 CLI_NODES=()
@@ -247,6 +258,9 @@ while [ $# -gt 0 ]; do
     --api-server)    API=$2; shift ;;
     --ntfy)          NOTIFY_NTFY_URL=$2; shift ;;      # "" to turn off
     --ha-webhook)    NOTIFY_HA_WEBHOOK=$2; shift ;;    # "" to turn off
+    --no-from)       SSH_FROM=0 ;;
+    --from)          SSH_FROM=1 ;;
+    --from-extra)    SSH_FROM_EXTRA=$2; shift ;;       # e.g. 10.8.0.0/24 (VPN / NAT)
     --verify)        VERIFY_ONLY=1 ;;
     -h|--help)       usage 0 ;;
     -*) echo "Unknown option: $1" >&2; usage 2 ;;
@@ -267,6 +281,7 @@ info "nodes:         ${BLD}${NODES[*]}${RST}"
 info "control plane: ${BLD}$CONTROL_PLANE_HOST${RST}"
 info "service acct:  ${BLD}$SVC_USER${RST}   bootstrap as: ${BLD}$ADMIN${RST}   running on: ${BLD}$SELF${RST}"
 info "notify:        ntfy ${BLD}${NOTIFY_NTFY_URL:-off}${RST}   Home Assistant ${BLD}${NOTIFY_HA_WEBHOOK:-off}${RST}"
+info "key from=:     ${BLD}$([ "$SSH_FROM" -eq 1 ] && echo "on${SSH_FROM_EXTRA:+ (+ $SSH_FROM_EXTRA)}" || echo off)${RST}"
 
 WORK=$(mktemp -d)
 CTL="$WORK/ctl"; mkdir -p "$CTL"
@@ -327,6 +342,8 @@ NODES=(${NODES[*]})
 SVC_USER="$SVC_USER"
 NOTIFY_NTFY_URL="$NOTIFY_NTFY_URL"
 NOTIFY_HA_WEBHOOK="$NOTIFY_HA_WEBHOOK"
+SSH_FROM=$SSH_FROM
+SSH_FROM_EXTRA="$SSH_FROM_EXTRA"
 EOF
 
 # ---------------------------------------------------------------- 1. account + key
@@ -344,8 +361,19 @@ step "2/4  Collecting public keys and host keys"
 for n in "${NODES[@]}"; do
   pub=$(if is_self "$n"; then cat "$CONF_DIR/$SVC_USER.pub"; else rssh "$n" cat "$CONF_DIR/$SVC_USER.pub"; fi) \
     || die "couldn't read key from $n"
-  echo "restrict,command=\"/usr/local/sbin/safe-power --ssh-gate\" $pub" >> "$WORK/authorized_keys"
-  ok "key from $n"
+  opts="restrict,command=\"/usr/local/sbin/safe-power --ssh-gate\""; addrs=""
+  if [ "$SSH_FROM" -eq 1 ]; then
+    addrs=$(if is_self "$n"; then cat "$CONF_DIR/$SVC_USER.addrs"; else rssh "$n" cat "$CONF_DIR/$SVC_USER.addrs"; fi 2>/dev/null)
+    addrs=$(tr -d ' \n' <<<"$addrs")
+    if [ -n "$addrs" ]; then
+      addrs+=${SSH_FROM_EXTRA:+,$(tr -d ' \n' <<<"$SSH_FROM_EXTRA")}
+      opts="from=\"$addrs\",$opts"
+    else
+      warn "no addresses recorded for $n — its key is NOT limited by from="
+    fi
+  fi
+  echo "$opts $pub" >> "$WORK/authorized_keys"
+  ok "key from $n${addrs:+ (only from $addrs)}"
   hk=$(ssh-keyscan -T 5 "$n" 2>/dev/null)
   if [ -n "$hk" ]; then
     echo "$hk" >> "$WORK/known_hosts"; ok "host key for $n"

@@ -8,6 +8,8 @@
 #   safe-power --restore  [NODE]   bring a drained node back (auto on boot)
 #   safe-power --status   [NODE]   drained / ok / failed
 #   safe-power --check    [NODE]   verify service account, SSH trust, kubectl
+#   safe-power --needs-reboot [NODE|--all]   does a node need a reboot?
+#   safe-power --cancel            cancel runs scheduled with --at
 #
 #   safe-power --reboot   --all    rolling reboot: other workers → control
 #                                  plane → this node last; one at a time,
@@ -27,6 +29,9 @@
 #            1h for running backups), --ignore-backups, --max-time=MINUTES
 #            (--all time limit, default 240), --allow-concurrent (skip the
 #            one-node-down lock), -h/--help
+#            --if-needed   with --reboot: only nodes that need it (pending
+#                          updates or a newer kernel)
+#            --at WHEN     run later: 03:00, "tomorrow 02:30", "2026-10-03 04:00"
 #
 #   Log: /var/log/safe-power.log on the node doing the work.  man safe-power
 #
@@ -72,6 +77,15 @@ CONVERGE_TIMEOUT=600      # seconds to wait after boot for Ready/services/health
 ROLL_PAUSE=60             # --all: seconds to let workloads settle between nodes
 ROLL_MAX=14400            # --all: don't start another node after this many seconds (0 = no limit)
 ONE_AT_A_TIME=1           # refuse to drain while another Kubernetes node is cordoned / NotReady
+
+# --- Mounts that must be up after boot, e.g. ("/mnt/nas_backups" "/mnt/restic-backups").
+# Checked on restore BEFORE containers start, so nothing writes into an empty mount point.
+REQUIRED_MOUNTS=()
+MOUNT_WAIT=120            # seconds to wait for each required mount after boot
+
+# --- --if-needed: what counts as "this node needs a reboot"
+REBOOT_REQUIRED_FILE="/var/run/reboot-required"   # Debian / Ubuntu
+BOOT_DIR="/boot"                                  # newest vmlinuz-* vs the running kernel
 
 # --- Notifications (blank = off). Set cluster-wide with safe-power-setup --ntfy / --ha-webhook.
 NOTIFY_NTFY_URL=""        # e.g. https://ntfy.sh/my-cluster  or  http://ntfy.lan/safe-power
@@ -181,6 +195,7 @@ ssh_gate() {
         case "$t" in
           --reboot|--shutdown|--drain|--restore|--status|--check|-y|--yes|-n|--dry-run) ;;
           --wait-backups|--ignore-backups|--no-evict|--allow-concurrent) ;;
+          --if-needed|--needs-reboot) ;;
           *) reject ;;
         esac
       done
@@ -330,6 +345,12 @@ wait_healthy() {
 # ============================================================ PHASE 1 + 2
 drain_and_power() {
   hdr "safe-power --$ACTION on $NODE_NAME ($ROLE)"
+
+  if [ "$ACTION" = "reboot" ] && [ "$IF_NEEDED" -eq 1 ]; then
+    local why
+    if why=$(reboot_needed); then log "🩺 Reboot needed: $why"
+    else ok "✅ No reboot needed on $NODE_NAME (--if-needed)"; return 0; fi
+  fi
 
   # ---- Preflight: package manager + running backups
   if pgrep -x "apt|apt-get|dpkg|unattended-upgr" >/dev/null; then
@@ -486,6 +507,16 @@ restore() {
   hdr "safe-power --restore on $NODE_NAME ($ROLE)"
   local failures=0 deadline
 
+  # Required mounts first: containers must not start on an empty mount point
+  if [ ${#REQUIRED_MOUNTS[@]} -gt 0 ]; then
+    local badm=0
+    wait_mounts || badm=$?
+    if [ "$badm" -gt 0 ]; then
+      failures=$((failures + badm))
+      notify fail "Mount missing" "$badm required mount(s) not up on $NODE_NAME after boot: ${REQUIRED_MOUNTS[*]}"
+    fi
+  fi
+
   # Docker side
   if command -v docker >/dev/null; then
     deadline=$((SECONDS + 120))
@@ -592,6 +623,10 @@ status() {
   if [ -f "$STATE_DIR/drained_at" ]; then echo "drained since $(cat "$STATE_DIR/drained_at")"
   elif [ -s "$STATE_DIR/last_result" ]; then cat "$STATE_DIR/last_result"
   else echo "ok"; fi
+  local t
+  while read -r t; do
+    [ -n "$t" ] && echo "   scheduled: $(awk '{print $1, $2, $3}' <<<"$t") → $(grep -oE 'safe-power-at-[0-9-]+' <<<"$t" | head -1)"
+  done < <(scheduled_timers)
 }
 
 check() {
@@ -605,6 +640,15 @@ check() {
   chk "service account '$SVC_USER'"          id "$SVC_USER"
   chk "passphrase-less SSH key"              svc_ready
   chk "sudoers rule (/etc/sudoers.d/safe-power)" test -f /etc/sudoers.d/safe-power
+  if [ -n "$SVC_HOME" ] && [ -s "$SVC_HOME/.ssh/authorized_keys" ]; then
+    local total limited
+    total=$(grep -c 'ssh-' "$SVC_HOME/.ssh/authorized_keys")
+    limited=$(grep -c '^from="' "$SVC_HOME/.ssh/authorized_keys")
+    if [ "$limited" -eq "$total" ]; then echo "  ${GRN}✔${RST} all $total trusted keys limited to their node's addresses (from=)"
+    else echo "  ${YLW}●${RST} $limited of $total trusted keys limited by from= (re-run safe-power-setup to add it)"; fi
+  fi
+  local m
+  for m in "${REQUIRED_MOUNTS[@]}"; do chk "required mount $m" mount_ok "$m"; done
   if kube_detect; then
     echo "  ${GRN}✔${RST} kubectl via $KUBE_MODE${KUBE_LOCAL_CFG:+ ($KUBE_LOCAL_CFG)}"
   else
@@ -641,6 +685,11 @@ remote_action() {
   local n=$1 rc args=("--$ACTION")
   case "$ACTION" in reboot|shutdown|drain|restore) args+=(-y) ;; esac
   [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
+  if [ "$ACTION" = "reboot" ] && [ "$IF_NEEDED" -eq 1 ]; then
+    local why
+    if why=$(node_needs_reboot "$n"); then log "🩺 $n needs a reboot: $why"
+    else ok "✅ $n doesn't need a reboot — skipping"; return 0; fi
+  fi
   case "$ACTION" in
     reboot|shutdown|drain)
       [ "$WAIT_BACKUPS" -eq 1 ]     && args+=(--wait-backups)
@@ -742,6 +791,17 @@ rolling_all() {
   build_order
   local -a order=("${ORDER[@]}")
 
+  if [ "$IF_NEEDED" -eq 1 ]; then
+    local -a needed=(); local why
+    for n in "${order[@]}"; do
+      if why=$(node_needs_reboot "$n"); then log "🩺 $n: $why"; needed+=("$n")
+      else log "✔  $n: no reboot needed"; fi
+    done
+    if [ ${#needed[@]} -eq 0 ]; then ok "✅ No node needs a reboot."; return 0; fi
+    order=("${needed[@]}")
+    IF_NEEDED=0   # already filtered; don't ask each node again
+  fi
+
   hdr "Rolling reboot ${WORKERS_ONLY_LABEL}from $NODE_NAME: ${order[*]}"
   [ "$ROLL_MAX" -gt 0 ] && log "⏱️  Time limit: no new node starts after $(dur "$ROLL_MAX")"
 
@@ -837,14 +897,126 @@ shutdown_all() {
   ok "⏻  Cluster shutdown sent to all selected nodes."
 }
 
+# ============================================================ --if-needed
+# reboot_needed — prints the reason and returns 0 if this node needs a reboot
+reboot_needed() {
+  if [ -f "$REBOOT_REQUIRED_FILE" ]; then
+    local pkgs=""
+    [ -s "$REBOOT_REQUIRED_FILE.pkgs" ] && pkgs=" ($(sort -u "$REBOOT_REQUIRED_FILE.pkgs" | head -5 | tr '\n' ' ' | sed 's/ $//'))"
+    echo "updates need a reboot$pkgs"; return 0
+  fi
+  if command -v needs-restarting >/dev/null; then       # RHEL / Fedora (dnf-utils)
+    needs-restarting -r >/dev/null 2>&1
+    [ $? -eq 1 ] && { echo "needs-restarting -r says so"; return 0; }
+  fi
+  local running newest
+  running=$(uname -r)
+  newest=$(find "$BOOT_DIR" -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | sed 's#.*/vmlinuz-##' | grep -v rescue | sort -V | tail -1)
+  if [ -n "$newest" ] && [ "$newest" != "$running" ]; then
+    echo "kernel $newest installed, $running running"; return 0
+  fi
+  return 1
+}
+
+# node_needs_reboot NODE — same, for any node (remote via the gate)
+node_needs_reboot() {
+  if [ "$1" = "$NODE_NAME" ]; then reboot_needed
+  else local out; out=$(svc_ssh "$1" safe-power --needs-reboot 2>/dev/null); [[ "$out" == yes* ]] && echo "${out#yes: }"
+  fi
+}
+
+needs_reboot_all() {
+  local n reason
+  select_nodes
+  hdr "Reboot needed?"
+  for n in "${SELECTED[@]}"; do
+    if reason=$(node_needs_reboot "$n"); then printf '  %s●%s %-20s yes — %s\n' "$YLW" "$RST" "$n" "$reason"
+    else printf '  %s✔%s %-20s no\n' "$GRN" "$RST" "$n"; fi
+  done
+}
+
+# ============================================================ --at / --cancel
+# schedule_at WHEN — run this same command later as a one-shot systemd timer.
+# Transient: a reboot of THIS node before WHEN cancels it.
+schedule_at() {
+  local when=$1 now target unit a
+  local -a args=()
+  now=$(date +%s)
+  target=$(date -d "$when" +%s 2>/dev/null) || die "Can't read --at '$when'. Try 03:00, 'tomorrow 02:30' or '2026-10-03 04:00'."
+  # a bare HH:MM that has already passed today means tomorrow
+  if [ "$target" -le "$now" ] && [[ "$when" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]; then
+    target=$(date -d "tomorrow $when" +%s)
+  fi
+  [ "$target" -gt "$now" ] || die "--at '$when' is in the past."
+  for a in "${PASS_ARGS[@]}"; do case "$a" in -n|--dry-run|-y|--yes) ;; *) args+=("$a") ;; esac; done
+  args+=(-y)
+  unit="safe-power-at-$(date -d "@$target" +%Y%m%d-%H%M%S)"
+
+  hdr "Schedule: safe-power ${args[*]}"
+  log "🗓️  At $(date -d "@$target" '+%a %F %T') (in $(dur $((target - now))))"
+  if [ "$ALL" -eq 1 ] && [ "$ACTION" != "drain" ]; then
+    local -a who=()
+    build_order; who=("${ORDER[@]}")
+    confirm_all "SCHEDULED ${ACTION^^}$([ "$IF_NEEDED" -eq 1 ] && echo " (ONLY IF NEEDED)")" "${who[@]}"
+  elif [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+    read -r -p "Schedule ${ACTION^^} of ${TARGET:-$NODE_NAME} for $(date -d "@$target" '+%a %F %T')? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted by user."
+  fi
+  run systemd-run --quiet --unit="$unit" --description="safe-power ${args[*]}" \
+      --on-active="$((target - now))s" --timer-property=AccuracySec=1s \
+      "$SCRIPT_PATH" "${args[@]}" || die "systemd-run failed."
+  ok "✅ Scheduled as $unit.timer. Cancel with: safe-power --cancel"
+  notify info "Scheduled" "safe-power ${args[*]} at $(date -d "@$target" '+%a %F %T') (from $NODE_NAME)"
+}
+
+scheduled_timers() {
+  systemctl list-timers --all --no-legend --plain 'safe-power-at-*' 2>/dev/null | awk 'NF {print}'
+}
+
+cancel_scheduled() {
+  local line unit n=0
+  while read -r line; do
+    unit=$(grep -oE 'safe-power-at-[0-9-]+\.timer' <<<"$line") || continue
+    run systemctl stop "$unit" && { ok "🗑️  Cancelled $unit"; n=$((n + 1)); }
+  done < <(scheduled_timers)
+  [ "$n" -gt 0 ] || log "Nothing scheduled."
+}
+
+# ============================================================ required mounts
+mount_ok() { findmnt -rn --mountpoint "$1" >/dev/null 2>&1 && timeout 10 stat -f "$1" >/dev/null 2>&1; }
+
+# wait_mounts — returns the number of REQUIRED_MOUNTS that never came up
+wait_mounts() {
+  local m bad=0 deadline tried
+  for m in "${REQUIRED_MOUNTS[@]}"; do
+    deadline=$((SECONDS + MOUNT_WAIT)); tried=0
+    until mount_ok "$m"; do
+      if [ "$tried" -eq 0 ]; then log "📂 $m not mounted yet — trying: mount $m"; mount "$m" >/dev/null 2>&1; tried=1; fi
+      [ "$SECONDS" -ge "$deadline" ] && break
+      sleep 5
+    done
+    if mount_ok "$m"; then ok "✅ $m is mounted"
+    else err "❌ $m is NOT mounted after ${MOUNT_WAIT}s — anything writing there is writing to the local disk"; bad=$((bad + 1)); fi
+  done
+  return "$bad"
+}
+
 # ============================================================ main
 [ "${1:-}" = "--ssh-gate" ] && ssh_gate
 
+ORIG_ARGS=("$@")
 ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0; ALL=0; WAIT_BACKUPS=0; IGNORE_BACKUPS=0
-WORKERS_ONLY=0; WORKERS_ONLY_LABEL=""; NO_EVICT=0; ALLOW_CONCURRENT=0
-for arg in "$@"; do
+WORKERS_ONLY=0; WORKERS_ONLY_LABEL=""; NO_EVICT=0; ALLOW_CONCURRENT=0; IF_NEEDED=0; AT=""
+PASS_ARGS=()   # everything except --at, for the scheduled run
+while [ $# -gt 0 ]; do
+  arg=$1; shift
   case "$arg" in
-    --reboot|--shutdown|--drain|--restore|--status|--check) ACTION="${arg#--}" ;;
+    --at)   [ $# -gt 0 ] || { echo "--at needs a time, e.g. --at 03:00" >&2; usage 2; }; AT=$1; shift; continue ;;
+    --at=*) AT=${arg#--at=}; continue ;;
+  esac
+  PASS_ARGS+=("$arg")
+  case "$arg" in
+    --reboot|--shutdown|--drain|--restore|--status|--check|--needs-reboot|--cancel) ACTION="${arg#--}" ;;
     --all)        ALL=1 ;;
     --workers-only)     WORKERS_ONLY=1; WORKERS_ONLY_LABEL="(workers only) " ;;
     --max-time=*)
@@ -852,6 +1024,7 @@ for arg in "$@"; do
       ROLL_MAX=$(( ${arg#--max-time=} * 60 )) ;;
     --no-evict)         NO_EVICT=1 ;;
     --allow-concurrent) ALLOW_CONCURRENT=1 ;;
+    --if-needed)        IF_NEEDED=1 ;;
     -y|--yes)     ASSUME_YES=1 ;;
     -n|--dry-run) DRY_RUN=1 ;;
     --no-wait)    NO_WAIT=1 ;;
@@ -862,36 +1035,44 @@ for arg in "$@"; do
     *)  [ -z "$TARGET" ] || { echo "Only one NODE allowed" >&2; usage 2; }; TARGET="$arg" ;;
   esac
 done
-[ -n "$ACTION" ] || { echo "Choose an action: --reboot --shutdown --drain --restore --status --check" >&2; usage 2; }
+[ -n "$ACTION" ] || { echo "Choose an action: --reboot --shutdown --drain --restore --status --check --needs-reboot --cancel" >&2; usage 2; }
 [ "$TARGET" = "$NODE_NAME" ] || [ "$TARGET" = "localhost" ] && TARGET=""
 [ "$WORKERS_ONLY" -eq 1 ] && [ "$ALL" -ne 1 ] && { echo "--workers-only needs --all" >&2; usage 2; }
+[ "$IF_NEEDED" -eq 1 ] && [ "$ACTION" != "reboot" ] && { echo "--if-needed only works with --reboot" >&2; usage 2; }
+if [ -n "$AT" ]; then
+  case "$ACTION" in reboot|shutdown|drain) ;; *) echo "--at only works with --reboot, --shutdown or --drain" >&2; usage 2 ;; esac
+fi
 
 # Require root: re-exec through sudo (prompts for password if needed)
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null || { echo "❌ Must run as root and sudo is not installed." >&2; exit 1; }
-  exec sudo -- "$SCRIPT_PATH" "$@"
+  exec sudo -- "$SCRIPT_PATH" "${ORIG_ARGS[@]}"
 fi
 
 if [ "$ALL" -eq 1 ]; then
   [ -z "$TARGET" ] || die "Use either NODE or --all, not both."
   [ ${#NODES[@]} -gt 0 ] || die "NODES is empty in $CONF_DIR/cluster.conf. Run safe-power-setup."
   case "$ACTION" in
-    status) status_all; exit 0 ;;
-    check)  check_all;  exit $? ;;
+    status)       status_all;       exit 0 ;;
+    check)        check_all;        exit $? ;;
+    needs-reboot) needs_reboot_all; exit 0 ;;
     reboot|shutdown) ;;
-    *) die "--all works with --reboot, --shutdown, --status and --check." ;;
+    *) die "--all works with --reboot, --shutdown, --status, --check and --needs-reboot." ;;
   esac
 elif [ -z "$TARGET" ]; then
   case "$ACTION" in
-    status) status; exit 0 ;;
-    check)  check;  exit $? ;;
+    status)       status; exit 0 ;;
+    check)        check;  exit $? ;;
+    needs-reboot) if reason=$(reboot_needed); then echo "yes: $reason"; exit 0; else echo "no"; exit 1; fi ;;
   esac
 fi
+[ "$ACTION" = "cancel" ] && { cancel_scheduled; exit $?; }
 
 mkdir -p "$STATE_DIR"
 # Log to file without color codes
 exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
+if [ -n "$AT" ]; then schedule_at "$AT"; exit $?; fi
 if [ "$ALL" -eq 1 ]; then
   if [ "$ACTION" = "shutdown" ]; then shutdown_all; else rolling_all; fi
   exit $?
