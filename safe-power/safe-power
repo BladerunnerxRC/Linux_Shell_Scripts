@@ -512,8 +512,12 @@ restore() {
     local badm=0
     wait_mounts || badm=$?
     if [ "$badm" -gt 0 ]; then
-      failures=$((failures + badm))
-      notify fail "Mount missing" "$badm required mount(s) not up on $NODE_NAME after boot: ${REQUIRED_MOUNTS[*]}"
+      # Stop here: no containers, no uncordon. The node stays drained and the
+      # restore unit stays armed, so the next boot (or a manual --restore) retries.
+      echo "failed: $badm required mount(s) missing $(date '+%F %T')" > "$STATE_DIR/last_result"
+      err "🛑 Not starting containers or uncordoning $NODE_NAME until the mount is back. Fix it, then run: safe-power --restore"
+      notify fail "Mount missing" "$badm required mount(s) not up on $NODE_NAME: ${REQUIRED_MOUNTS[*]}. Node left drained; fix it, then: safe-power --restore $NODE_NAME"
+      exit 1
     fi
   fi
 
@@ -620,7 +624,12 @@ restore() {
 
 # ============================================================ status / check
 status() {
-  if [ -f "$STATE_DIR/drained_at" ]; then echo "drained since $(cat "$STATE_DIR/drained_at")"
+  # a restore that stopped early (e.g. mount missing) leaves the node drained
+  # but must still read as failed, so a waiting rollout stops instead of timing out
+  if [ -f "$STATE_DIR/drained_at" ] && [ "$STATE_DIR/last_result" -nt "$STATE_DIR/drained_at" ] \
+     && grep -q '^failed' "$STATE_DIR/last_result"; then
+    echo "$(cat "$STATE_DIR/last_result") — still drained since $(cat "$STATE_DIR/drained_at")"
+  elif [ -f "$STATE_DIR/drained_at" ]; then echo "drained since $(cat "$STATE_DIR/drained_at")"
   elif [ -s "$STATE_DIR/last_result" ]; then cat "$STATE_DIR/last_result"
   else echo "ok"; fi
   local t
@@ -686,9 +695,13 @@ remote_action() {
   case "$ACTION" in reboot|shutdown|drain|restore) args+=(-y) ;; esac
   [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
   if [ "$ACTION" = "reboot" ] && [ "$IF_NEEDED" -eq 1 ]; then
-    local why
-    if why=$(node_needs_reboot "$n"); then log "🩺 $n needs a reboot: $why"
-    else ok "✅ $n doesn't need a reboot — skipping"; return 0; fi
+    local why nrc
+    why=$(node_needs_reboot "$n"); nrc=$?
+    case "$nrc" in
+      0) log "🩺 $n needs a reboot: $why" ;;
+      1) ok "✅ $n doesn't need a reboot — skipping"; return 0 ;;
+      *) err "❌ Can't ask $n whether it needs a reboot ($why)."; return 1 ;;
+    esac
   fi
   case "$ACTION" in
     reboot|shutdown|drain)
@@ -792,10 +805,14 @@ rolling_all() {
   local -a order=("${ORDER[@]}")
 
   if [ "$IF_NEEDED" -eq 1 ]; then
-    local -a needed=(); local why
+    local -a needed=(); local why nrc
     for n in "${order[@]}"; do
-      if why=$(node_needs_reboot "$n"); then log "🩺 $n: $why"; needed+=("$n")
-      else log "✔  $n: no reboot needed"; fi
+      why=$(node_needs_reboot "$n"); nrc=$?
+      case "$nrc" in
+        0) log "🩺 $n: $why"; needed+=("$n") ;;
+        1) log "✔  $n: no reboot needed" ;;
+        *) die "Can't ask $n whether it needs a reboot ($why). Nothing was started; fix it (safe-power --check --all) and try again." ;;
+      esac
     done
     if [ ${#needed[@]} -eq 0 ]; then ok "✅ No node needs a reboot."; return 0; fi
     order=("${needed[@]}")
@@ -912,26 +929,38 @@ reboot_needed() {
   local running newest
   running=$(uname -r)
   newest=$(find "$BOOT_DIR" -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | sed 's#.*/vmlinuz-##' | grep -v rescue | sort -V | tail -1)
-  if [ -n "$newest" ] && [ "$newest" != "$running" ]; then
+  # only a strictly NEWER installed kernel counts (old ones may have been removed)
+  if [ -n "$newest" ] && [ "$newest" != "$running" ] && \
+     [ "$(printf '%s\n%s\n' "$running" "$newest" | sort -V | tail -1)" = "$newest" ]; then
     echo "kernel $newest installed, $running running"; return 0
   fi
   return 1
 }
 
-# node_needs_reboot NODE — same, for any node (remote via the gate)
+# node_needs_reboot NODE — same, for any node (remote via the gate).
+# Returns 0 = yes (prints reason), 1 = no, 2 = couldn't ask (prints why).
 node_needs_reboot() {
-  if [ "$1" = "$NODE_NAME" ]; then reboot_needed
-  else local out; out=$(svc_ssh "$1" safe-power --needs-reboot 2>/dev/null); [[ "$out" == yes* ]] && echo "${out#yes: }"
-  fi
+  if [ "$1" = "$NODE_NAME" ]; then reboot_needed; return; fi
+  local out
+  out=$(svc_ssh "$1" safe-power --needs-reboot 2>/dev/null)
+  case "$out" in
+    yes*) echo "${out#yes: }"; return 0 ;;
+    no)   return 1 ;;
+    *)    echo "unreachable or no answer"; return 2 ;;
+  esac
 }
 
 needs_reboot_all() {
-  local n reason
+  local n reason rc
   select_nodes
   hdr "Reboot needed?"
   for n in "${SELECTED[@]}"; do
-    if reason=$(node_needs_reboot "$n"); then printf '  %s●%s %-20s yes — %s\n' "$YLW" "$RST" "$n" "$reason"
-    else printf '  %s✔%s %-20s no\n' "$GRN" "$RST" "$n"; fi
+    reason=$(node_needs_reboot "$n"); rc=$?
+    case "$rc" in
+      0) printf '  %s●%s %-20s yes — %s\n' "$YLW" "$RST" "$n" "$reason" ;;
+      1) printf '  %s✔%s %-20s no\n' "$GRN" "$RST" "$n" ;;
+      *) printf '  %s✘%s %-20s ? — %s\n' "$RED" "$RST" "$n" "$reason" ;;
+    esac
   done
 }
 
@@ -965,6 +994,9 @@ schedule_at() {
   run systemd-run --quiet --unit="$unit" --description="safe-power ${args[*]}" \
       --on-active="$((target - now))s" --timer-property=AccuracySec=1s \
       "$SCRIPT_PATH" "${args[@]}" || die "systemd-run failed."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "DRY-RUN: would schedule $unit.timer (nothing was scheduled)"; return 0
+  fi
   ok "✅ Scheduled as $unit.timer. Cancel with: safe-power --cancel"
   notify info "Scheduled" "safe-power ${args[*]} at $(date -d "@$target" '+%a %F %T') (from $NODE_NAME)"
 }
@@ -991,7 +1023,12 @@ wait_mounts() {
   for m in "${REQUIRED_MOUNTS[@]}"; do
     deadline=$((SECONDS + MOUNT_WAIT)); tried=0
     until mount_ok "$m"; do
-      if [ "$tried" -eq 0 ]; then log "📂 $m not mounted yet — trying: mount $m"; mount "$m" >/dev/null 2>&1; tried=1; fi
+      if [ "$tried" -eq 0 ]; then
+        # one attempt, bounded by what's left of MOUNT_WAIT (a dead NFS server can hang mount)
+        log "📂 $m not mounted yet — trying: mount $m"
+        timeout -k 5 "$(( deadline - SECONDS > 1 ? deadline - SECONDS : 1 ))" mount "$m" >/dev/null 2>&1
+        tried=1
+      fi
       [ "$SECONDS" -ge "$deadline" ] && break
       sleep 5
     done

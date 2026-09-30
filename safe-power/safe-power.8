@@ -162,7 +162,11 @@ seconds for each path in
 once. This happens
 .B before
 any container starts, so nothing writes into an empty mount point on the local
-disk. A missing mount counts as a failed restore and sends a notification.
+disk. If a mount is still missing, the restore stops right there: no containers
+start, the node stays cordoned and drained, \fB\-\-status\fP reports it as failed,
+and a notification is sent. The next boot retries, or run
+.B safe-power \-\-restore
+after fixing the mount.
 .IP \(bu 2
 Sets the Swarm node active again.
 .IP \(bu 2
