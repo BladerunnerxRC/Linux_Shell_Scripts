@@ -319,15 +319,17 @@ for n in "${NODES[@]}"; do
   fi
 done
 
-cat > "$WORK/cluster.conf" <<EOF
-# /etc/safe-power/cluster.conf — written by safe-power-setup on $(date '+%F %T') from $SELF
-# Identical on every node. Re-run safe-power-setup to change it.
-CONTROL_PLANE_HOST="$CONTROL_PLANE_HOST"
-NODES=(${NODES[*]})
-SVC_USER="$SVC_USER"
-NOTIFY_NTFY_URL="$NOTIFY_NTFY_URL"
-NOTIFY_HA_WEBHOOK="$NOTIFY_HA_WEBHOOK"
-EOF
+# cluster.conf is sourced as bash by root on every node: every value is written
+# with printf %q so nothing in it (quotes, $( ), ;) can run as code.
+{
+  echo "# /etc/safe-power/cluster.conf — written by safe-power-setup on $(date '+%F %T') from $SELF"
+  echo "# Identical on every node. Re-run safe-power-setup to change it."
+  printf 'CONTROL_PLANE_HOST=%q\n' "$CONTROL_PLANE_HOST"
+  printf 'NODES=(%s)\n' "$(printf '%q ' "${NODES[@]}" | sed 's/ $//')"
+  printf 'SVC_USER=%q\n' "$SVC_USER"
+  printf 'NOTIFY_NTFY_URL=%q\n' "$NOTIFY_NTFY_URL"
+  printf 'NOTIFY_HA_WEBHOOK=%q\n' "$NOTIFY_HA_WEBHOOK"
+} > "$WORK/cluster.conf"
 
 # ---------------------------------------------------------------- 1. account + key
 step "1/4  Service account, passphrase-less key, sudoers on every node"
