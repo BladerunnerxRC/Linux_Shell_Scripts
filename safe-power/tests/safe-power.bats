@@ -414,3 +414,11 @@ S
   [ $((SECONDS - start)) -lt 15 ]
   [[ "$output" == *"Timed out waiting for optiplex-two"* ]]
 }
+
+@test "restore unit timeout covers mounts, tiers, and every health URL" {
+  conf 'REQUIRED_MOUNTS=(/a /b)' 'MOUNT_WAIT=100' 'HEALTH_WAIT=50' 'CONVERGE_TIMEOUT=200' 'HEALTH_URLS=(u1 u2)'
+  run "$SP" --drain -y
+  [ "$status" -eq 0 ]
+  # worker: 120 + 100*2 + 50*3 + 200*(2+0 urls) + 300
+  grep -qx "TimeoutStartSec=$((120 + 200 + 150 + 400 + 300))" "$H/restore.service"
+}

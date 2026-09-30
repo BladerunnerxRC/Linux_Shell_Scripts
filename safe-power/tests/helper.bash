@@ -15,6 +15,7 @@ setup() {
   sed -e "s#^CONF_DIR=.*#CONF_DIR=$H/conf#" \
       -e "s#^STATE_DIR=.*#STATE_DIR=$H/state#" \
       -e "s#^LOG_FILE=.*#LOG_FILE=$H/log#" \
+      -e "s#^UNIT_FILE=.*#UNIT_FILE=$H/restore.service#" \
       -e 's#^svc_ready() .*#svc_ready() { true; }#' \
       -e 's#^if \[ "$(id -u)" -ne 0 \]; then#if false; then#' \
       "$REPO_DIR/safe-power" > "$H/sp"
