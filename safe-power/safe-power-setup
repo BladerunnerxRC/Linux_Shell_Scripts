@@ -13,7 +13,8 @@
 #   --api-server URL       API URL workers should use    (default: from admin kubeconfig)
 #
 # On every node it:
-#   1. installs safe-power + safe-power-setup to /usr/local/sbin
+#   1. installs safe-power + safe-power-setup to /usr/local/sbin, and the
+#      man page (man safe-power); creates /etc/safe-power/local.conf once
 #   2. writes /etc/safe-power/cluster.conf (same on all nodes)
 #   3. creates the locked system account 'safepower' with a passphrase-less
 #      ed25519 key
@@ -54,7 +55,19 @@ node_init() {   # STAGE_DIR — install files, service account, key, sudoers
   install -m 755 "$stage/safe-power-setup" /usr/local/sbin/safe-power-setup
   install -d -m 755 "$CONF_DIR"
   install -m 644 "$stage/cluster.conf" "$CONF_DIR/cluster.conf"
-  ok "installed safe-power, safe-power-setup, cluster.conf"
+  if [ -f "$stage/safe-power.8" ]; then
+    install -D -m 644 "$stage/safe-power.8" /usr/local/share/man/man8/safe-power.8
+    command -v mandb >/dev/null && mandb -q /usr/local/share/man 2>/dev/null
+  fi
+  [ -f "$CONF_DIR/local.conf" ] || cat > "$CONF_DIR/local.conf" <<'EOF'
+# /etc/safe-power/local.conf — your overrides for THIS node (never touched by setup).
+# Any variable from the top of safe-power can be set here, e.g.:
+#   HEALTH_URLS=("http://localhost:3000")
+#   BLOCKING_CONTAINERS=("backup-job" "nightly-dump")
+#   BACKUP_WAIT=1800
+#   ROLL_PAUSE=120
+EOF
+  ok "installed safe-power, safe-power-setup, man page, cluster.conf"
 
   if ! id "$u" >/dev/null 2>&1; then
     useradd --system --create-home --home-dir "/home/$u" --shell /bin/bash \
@@ -313,7 +326,8 @@ EOF
 step "1/4  Service account, passphrase-less key, sudoers on every node"
 for n in "${NODES[@]}"; do
   echo "  ${BLD}$n${RST}"
-  push "$n" "$SCRIPT_DIR/safe-power" "$SCRIPT_DIR/safe-power-setup" "$WORK/cluster.conf"
+  push "$n" "$SCRIPT_DIR/safe-power" "$SCRIPT_DIR/safe-power-setup" "$WORK/cluster.conf" \
+       $( [ -f "$SCRIPT_DIR/safe-power.8" ] && echo "$SCRIPT_DIR/safe-power.8" )
   as_root "$n" bash "${STAGE[$n]}/safe-power-setup" --node-init "${STAGE[$n]}" || die "node setup failed on $n"
 done
 

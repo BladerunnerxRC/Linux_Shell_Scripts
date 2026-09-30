@@ -19,7 +19,10 @@
 #   runs on NODE itself over SSH as the safepower service account.
 #
 #   Options: -y/--yes (no prompt), -n/--dry-run, --no-wait (don't wait for a
-#            remote reboot to finish restoring), -h/--help
+#            remote reboot to finish restoring), --wait-backups (wait up to
+#            1h for running backups), --ignore-backups, -h/--help
+#
+#   Log: /var/log/safe-power.log on the node doing the work.  man safe-power
 #
 # Role is picked from the hostname:
 #   Control plane — kubectl drain self, drain Swarm node, stop Docker
@@ -42,8 +45,22 @@ HEALTH_URLS=(                                 # checked on the control plane onl
   "http://localhost:3000"   # grafana
   "http://localhost:8080"   # jira
 )
-BLOCKING_CONTAINERS=("backup-job")            # refuse to run while these run
-STOP_TIMEOUT=60           # seconds per container for graceful stop
+# --- Backup detection (preflight). Regexes are extended (ERE), case-sensitive.
+BACKUP_PROCS="restic|borg|borgmatic|kopia|duplicity|rsnapshot|rdiff-backup|vzdump|veeamagent|pg_dump|pg_dumpall|mysqldump|mariadb-dump|mongodump|xtrabackup|mariabackup"
+BACKUP_CMDLINE="docker_backup|backup\.sh"     # scripts, matched against the full command line
+BACKUP_IGNORE=" (server|mount|serve-http)( |$)"   # long-running daemons that aren't a backup in progress
+BACKUP_UNITS="backup|borg|restic|rsnapshot|kopia|duplicati|veeam"   # systemd services still running
+BLOCKING_CONTAINERS=("backup-job")            # one-shot containers: running at all = backup in progress
+BACKUP_WAIT=0             # seconds to wait for backups to finish; 0 = abort (--wait-backups: 3600)
+
+# --- Docker shutdown order. Tier 1 apps → tier 2 data → tier 3 infrastructure.
+# Override per container with label safe-power.tier=1|2|3, or safe-power.skip=true.
+DB_IMAGES="postgres|postgis|timescale|mysql|mariadb|mongo|redis|valkey|keydb|influxdb|elasticsearch|opensearch|clickhouse|cassandra|couchdb|etcd|rabbitmq|mosquitto|emqx|nats|kafka|zookeeper|minio"
+INFRA_IMAGES="traefik|nginx-proxy|caddy|haproxy|pihole|adguard|unbound|bind9|coredns|portainer|wireguard|tailscale|cloudflared|authelia|authentik"
+IMAGE_SUFFIXES="db|ql|sql|server|ce|ee|oss|home|manager|stack|alpine"   # postgresql, portainer-ce, adguardhome …
+STOP_TIMEOUT=60           # seconds for apps (tier 1) and infrastructure (tier 3)
+DB_STOP_TIMEOUT=120       # seconds for databases / brokers (tier 2)
+HEALTH_WAIT=120           # restore: seconds to wait for a tier's healthchecks before the next
 DRAIN_TIMEOUT=300         # seconds for kubectl drain / swarm tasks to leave
 CONVERGE_TIMEOUT=600      # seconds to wait after boot for Ready/services/health
 ROLL_PAUSE=60             # --all: seconds to let workloads settle between nodes
@@ -54,8 +71,11 @@ UNIT_NAME="safe-power-restore.service"
 UNIT_FILE="/etc/systemd/system/${UNIT_NAME}"
 SCRIPT_PATH="$(readlink -f "$0")"
 
+# cluster.conf is rewritten by safe-power-setup; put per-node overrides in local.conf
 # shellcheck source=/dev/null
 [ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
+# shellcheck source=/dev/null
+[ -r "$CONF_DIR/local.conf" ] && . "$CONF_DIR/local.conf"
 
 SVC_KUBECONFIG="$CONF_DIR/kubeconfig"
 SVC_HOME="$(getent passwd "$SVC_USER" | cut -d: -f6)"
@@ -78,7 +98,7 @@ err()  { log "${RED}$*${RST}"; }
 hdr()  { echo "${CYN}${BLD}== $* ==${RST}"; }
 die()  { err "❌ $*"; exit 1; }
 run()  { if [ "$DRY_RUN" -eq 1 ]; then log "${YLW}DRY-RUN:${RST} $*"; else "$@"; fi; }
-usage() { sed -n '2,29p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SCRIPT_PATH"; exit "${1:-0}"; }
 
 # ------------------------------------------------------------ service-account SSH
 svc_ready() { [ -n "$SVC_HOME" ] && [ -f "$SVC_HOME/.ssh/id_ed25519" ]; }
@@ -103,7 +123,7 @@ ssh_gate() {
     true) exit 0 ;;
     safe-power)
       for t in "${w[@]:1}"; do
-        case "$t" in --reboot|--shutdown|--drain|--restore|--status|--check|-y|--yes|-n|--dry-run) ;; *) reject ;; esac
+        case "$t" in --reboot|--shutdown|--drain|--restore|--status|--check|-y|--yes|-n|--dry-run|--wait-backups|--ignore-backups) ;; *) reject ;; esac
       done
       exec sudo -n "$SCRIPT_PATH" "${w[@]:1}" ;;
     kubectl)
@@ -157,22 +177,141 @@ have_docker()      { command -v docker >/dev/null && docker info >/dev/null 2>&1
 swarm_active()     { [ "$(docker info -f '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; }
 swarm_task_count() { docker ps -q --filter label=com.docker.swarm.service.id | wc -l; }
 
+# ------------------------------------------------------------ backup detection
+# Prints one line per backup in progress; returns 0 if any were found.
+# Host processes include those inside containers (same PID namespace view).
+detect_backups() {
+  local found="" pid cmd cid cname c
+  while read -r pid cmd; do
+    [ -z "$pid" ] && continue
+    [[ " $cmd " =~ $BACKUP_IGNORE ]] && continue
+    cname=""
+    cid=$(grep -oE '[0-9a-f]{64}' "/proc/$pid/cgroup" 2>/dev/null | head -1)
+    [ -n "$cid" ] && command -v docker >/dev/null && cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null)
+    found+="process ${cname:+[container ${cname#/}] }pid $pid: ${cmd:0:110}"$'\n'
+  done < <(
+    pgrep -a -x -- "$BACKUP_PROCS" 2>/dev/null
+    [ -n "$BACKUP_CMDLINE" ] && pgrep -a -f -- "$BACKUP_CMDLINE" 2>/dev/null
+  )
+  # oneshot services show as "activating" while they run
+  while read -r c; do
+    [ -n "$c" ] && found+="systemd unit $c is running"$'\n'
+  done < <(systemctl list-units --type=service --state=activating,deactivating --no-legend --plain 2>/dev/null \
+           | awk '{print $1}' | grep -E -- "$BACKUP_UNITS")
+  if have_docker; then
+    for c in "${BLOCKING_CONTAINERS[@]}"; do
+      while read -r cname; do
+        [ -n "$cname" ] && found+="container $cname is running"$'\n'
+      done < <(docker ps --format '{{.Names}}' | grep -- "$c")
+    done
+  fi
+  [ -n "$found" ] || return 1
+  sort -u <<<"${found%$'\n'}"
+}
+
+# ------------------------------------------------------------ container discovery
+# Prints "tier<TAB>name<TAB>project<TAB>image" for every running container this
+# node should stop itself: not Swarm tasks (Swarm drain moves them), not
+# Kubernetes-managed (kubectl drain handles those), not labelled safe-power.skip.
+discover_containers() {
+  local name image proj swarm k8s tier skip base
+  # '|' separator: tab is IFS whitespace, so read would merge empty fields
+  docker ps --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.swarm.service.id"}}|{{.Label "io.kubernetes.pod.name"}}|{{.Label "safe-power.tier"}}|{{.Label "safe-power.skip"}}' |
+  while IFS='|' read -r name image proj swarm k8s tier skip; do
+    { [ -n "$swarm" ] || [ -n "$k8s" ] || [ "$skip" = "true" ]; } && continue
+    if ! [[ "$tier" =~ ^[123]$ ]]; then
+      # match the image's own name (no registry/owner/tag): postgres, bitnami/postgresql, mariadb:11 …
+      base=${image##*/}; base=${base%%[:@]*}; base=${base,,}
+      tier=1
+      [[ "$base" =~ ^($DB_IMAGES)([-_]?($IMAGE_SUFFIXES))?$ ]]    && tier=2
+      [[ "$base" =~ ^($INFRA_IMAGES)([-_]?($IMAGE_SUFFIXES))?$ ]] && tier=3
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$tier" "$name" "${proj:--}" "$image"
+  done | sort -t$'\t' -k1,1n -k3,3 -k2,2
+}
+
+tier_name() { case "$1" in 1) echo "apps" ;; 2) echo "data" ;; 3) echo "infra" ;; esac; }
+
+# stop_tiers LIST — stop tier 1, then 2, then 3; report force-kills
+stop_tiers() {
+  local list=$1 t timeout c st
+  local -a names
+  for t in 1 2 3; do
+    mapfile -t names < <(awk -F'\t' -v t="$t" '$1==t {print $2}' <<<"$list")
+    [ ${#names[@]} -gt 0 ] || continue
+    timeout=$STOP_TIMEOUT; [ "$t" -eq 2 ] && timeout=$DB_STOP_TIMEOUT
+    log "🛑 Stopping tier $t ($(tier_name "$t")): ${names[*]} (timeout ${timeout}s)"
+    run docker stop -t "$timeout" "${names[@]}" >/dev/null
+    [ "$DRY_RUN" -eq 1 ] && continue
+    for c in "${names[@]}"; do
+      st=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$c" 2>/dev/null)
+      case "$st" in
+        true*)  err "❌ $c is still running" ;;
+        *" 137") warn "⚠️  $c didn't stop within ${timeout}s and was killed — raise its timeout or check its shutdown" ;;
+      esac
+    done
+  done
+}
+
+# wait_healthy NAME... — wait (up to HEALTH_WAIT) for containers that have a healthcheck
+wait_healthy() {
+  local deadline=$((SECONDS + HEALTH_WAIT)) c h pending
+  while :; do
+    pending=""
+    for c in "$@"; do
+      h=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)
+      [ -n "$h" ] && [ "$h" != "healthy" ] && pending+="$c($h) "
+    done
+    [ -z "$pending" ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && { warn "⚠️  Not healthy after ${HEALTH_WAIT}s: $pending"; return 1; }
+    sleep 5
+  done
+}
+
 # ============================================================ PHASE 1 + 2
 drain_and_power() {
   hdr "safe-power --$ACTION on $NODE_NAME ($ROLE)"
 
-  # Preflight
+  # ---- Preflight: package manager + running backups
   if pgrep -x "apt|apt-get|dpkg|unattended-upgr" >/dev/null; then
     die "apt/dpkg is running. Try again when it finishes."
   fi
-  local docker_ok=0 standalone=""
+  local backups deadline
+  if backups=$(detect_backups); then
+    warn "💾 Backup in progress on $NODE_NAME:"; sed 's/^/     - /' <<<"$backups"
+    if [ "$IGNORE_BACKUPS" -eq 1 ]; then
+      warn "⚠️  --ignore-backups given; continuing anyway."
+    elif [ "$DRY_RUN" -eq 1 ]; then
+      warn "DRY-RUN: a real run would $([ "$BACKUP_WAIT" -gt 0 ] && echo "wait up to ${BACKUP_WAIT}s" || echo "abort") here."
+    elif [ "$BACKUP_WAIT" -gt 0 ]; then
+      log "⏳ Waiting up to ${BACKUP_WAIT}s for backups to finish"
+      deadline=$((SECONDS + BACKUP_WAIT))
+      while backups=$(detect_backups); do
+        [ "$SECONDS" -ge "$deadline" ] && { sed 's/^/     - /' <<<"$backups"; die "Backups still running after ${BACKUP_WAIT}s."; }
+        sleep 30
+      done
+      ok "✅ Backups finished"
+    else
+      die "Not powering off during a backup. Re-run with --wait-backups to wait, or --ignore-backups to override."
+    fi
+  else
+    ok "✅ No running backups detected"
+  fi
+
+  # ---- Discover local Docker containers
+  local docker_ok=0 containers=""
   if have_docker; then
     docker_ok=1
-    for c in "${BLOCKING_CONTAINERS[@]}"; do
-      docker ps --format '{{.Names}}' | grep -q -- "$c" && die "'$c' is running. Try again when it finishes."
-    done
-    standalone=$(docker ps --format '{{.Names}}\t{{.Label "com.docker.swarm.service.id"}}' \
-                 | awk -F'\t' '$2=="" {print $1}')
+    containers=$(discover_containers)
+    if [ -n "$containers" ]; then
+      log "🐳 Local containers to stop ($(grep -c . <<<"$containers")), in this order:"
+      printf '     %-8s %-30s %-18s %s\n' "TIER" "CONTAINER" "PROJECT" "IMAGE"
+      while IFS=$'\t' read -r t n p i; do
+        printf '     %-8s %-30s %-18s %s\n' "$t $(tier_name "$t")" "$n" "$p" "$i"
+      done <<<"$containers"
+    else
+      log "🐳 No local containers to stop"
+    fi
   fi
 
   if kube_detect; then
@@ -185,7 +324,6 @@ drain_and_power() {
 
   # Summary + confirm
   [ -n "$KUBE_MODE" ] && log "📋 Pods on $NODE_NAME: $(kube get pods -A --field-selector "spec.nodeName=$NODE_NAME" --no-headers 2>/dev/null | wc -l)"
-  [ "$docker_ok" -eq 1 ] && log "📋 Standalone containers: $(grep -c . <<<"$standalone")"
   [ "$ROLE" = "control-plane" ] && [ "$ACTION" = "shutdown" ] && \
     warn "⚠️  Shutting down the control plane: workers keep running but the cluster can't be managed until it's back."
 
@@ -195,7 +333,7 @@ drain_and_power() {
   fi
 
   if [ "$DRY_RUN" -ne 1 ]; then
-    echo "$standalone" > "$STATE_DIR/containers.txt"
+    echo "$containers" > "$STATE_DIR/containers.txt"
     date '+%F %T'      > "$STATE_DIR/drained_at"
   fi
 
@@ -224,12 +362,8 @@ drain_and_power() {
     fi
   fi
 
-  # 1c. Standalone containers (reverse start order)
-  if [ -n "$standalone" ]; then
-    log "🛑 Stopping standalone containers (timeout ${STOP_TIMEOUT}s each)"
-    # shellcheck disable=SC2086
-    run docker stop -t "$STOP_TIMEOUT" $(tac <<<"$standalone") >/dev/null
-  fi
+  # 1c. Local containers: apps → data → infra
+  [ -n "$containers" ] && stop_tiers "$containers"
 
   # Arm the restore unit
   log "🔧 Enabling $UNIT_NAME for restore on next boot"
@@ -276,14 +410,26 @@ restore() {
         log "🔌 Swarm node $nid → active"
         docker node update --availability active "$nid" >/dev/null || { err "❌ Swarm activate failed"; failures=$((failures + 1)); }
       fi
+      # Start in reverse tier order: infra → data → apps, waiting for healthchecks in between
       if [ -s "$STATE_DIR/containers.txt" ]; then
-        while read -r c; do
-          [ -z "$c" ] && continue
-          if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" != "true" ]; then
-            log "▶️  Starting $c"
-            docker start "$c" >/dev/null || { err "❌ Failed to start $c"; failures=$((failures + 1)); }
-          fi
-        done < "$STATE_DIR/containers.txt"
+        local t c; local -a names started
+        for t in 3 2 1; do
+          # old state files hold bare names → tier 1
+          mapfile -t names < <(awk -F'\t' -v t="$t" 'NF==1 && $1!="" && t==1 {print $1} NF>1 && $1==t {print $2}' "$STATE_DIR/containers.txt")
+          [ ${#names[@]} -gt 0 ] || continue
+          log "▶️  Starting tier $t ($(tier_name "$t")): ${names[*]}"
+          started=()
+          for c in "${names[@]}"; do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ]; then
+              started+=("$c")
+            elif docker start "$c" >/dev/null; then
+              started+=("$c")
+            else
+              err "❌ Failed to start $c"; failures=$((failures + 1))
+            fi
+          done
+          [ ${#started[@]} -gt 0 ] && { wait_healthy "${started[@]}" || failures=$((failures + 1)); }
+        done
       fi
     else
       err "❌ Docker didn't come up"; failures=$((failures + 1))
@@ -405,6 +551,11 @@ remote_action() {
   local n=$1 rc args=("--$ACTION")
   case "$ACTION" in reboot|shutdown|drain|restore) args+=(-y) ;; esac
   [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
+  case "$ACTION" in
+    reboot|shutdown|drain)
+      [ "$WAIT_BACKUPS" -eq 1 ]   && args+=(--wait-backups)
+      [ "$IGNORE_BACKUPS" -eq 1 ] && args+=(--ignore-backups) ;;
+  esac
 
   log "📡 $NODE_NAME → $n: safe-power ${args[*]}"
   svc_ssh "$n" safe-power "${args[@]}"; rc=$?
@@ -517,7 +668,7 @@ rolling_all() {
 # ============================================================ main
 [ "${1:-}" = "--ssh-gate" ] && ssh_gate
 
-ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0; ALL=0
+ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0; ALL=0; WAIT_BACKUPS=0; IGNORE_BACKUPS=0
 for arg in "$@"; do
   case "$arg" in
     --reboot|--shutdown|--drain|--restore|--status|--check) ACTION="${arg#--}" ;;
@@ -525,6 +676,8 @@ for arg in "$@"; do
     -y|--yes)     ASSUME_YES=1 ;;
     -n|--dry-run) DRY_RUN=1 ;;
     --no-wait)    NO_WAIT=1 ;;
+    --wait-backups)   WAIT_BACKUPS=1; [ "$BACKUP_WAIT" -gt 0 ] || BACKUP_WAIT=3600 ;;
+    --ignore-backups) IGNORE_BACKUPS=1 ;;
     -h|--help)    usage 0 ;;
     -*) echo "Unknown option: $arg" >&2; usage 2 ;;
     *)  [ -z "$TARGET" ] || { echo "Only one NODE allowed" >&2; usage 2; }; TARGET="$arg" ;;

@@ -1,0 +1,415 @@
+.\" Man page for safe-power.  View locally:  man ./safe-power.8
+.TH SAFE-POWER 8 "2026-09-30" "safe-power 2.0" "System Administration"
+.SH NAME
+safe-power \- drain, reboot or shut down a Kubernetes/Docker node safely, and restore it on boot
+.SH SYNOPSIS
+.B safe-power
+.RB { \-\-reboot | \-\-shutdown | \-\-drain | \-\-restore | \-\-status | \-\-check }
+.RI [ NODE ]
+.RI [ options ]
+.br
+.B safe-power
+.RB { \-\-reboot | \-\-status | \-\-check }
+.B \-\-all
+.RI [ options ]
+.br
+.B safe-power-setup
+.RI [ options ]
+.IR NODE ...
+.SH DESCRIPTION
+.B safe-power
+takes a node out of service cleanly before powering it off, and puts it back
+automatically when it boots. It can be run on any node of the cluster and can
+target any node, or roll through the whole cluster one node at a time.
+.PP
+When run as a normal user it re-executes itself through
+.BR sudo (8).
+.PP
+The node's role is taken from its short hostname: the host named by
+.B CONTROL_PLANE_HOST
+is the control plane, and every other host is a worker.
+.SH PHASES
+A power action runs these phases in order. If any phase fails before the
+power action, the node is left running and in service.
+.TP
+.B 1. Preflight
+Aborts if
+.BR apt / dpkg
+is running.
+.TP
+.B 2. Backup detection
+Looks for a backup in progress, anywhere on the node:
+.RS
+.IP \(bu 2
+processes named in
+.B BACKUP_PROCS
+(restic, borg, kopia, vzdump, veeamagent, pg_dump, mysqldump, ...), including
+processes running inside containers, which are reported with the container
+name. Long-running daemons that match
+.B BACKUP_IGNORE
+(for example
+.IR "kopia server" ,
+.IR "restic mount" )
+are ignored;
+.IP \(bu 2
+command lines matching
+.B BACKUP_CMDLINE
+(backup scripts such as
+.IR backup.sh );
+.IP \(bu 2
+systemd services matching
+.B BACKUP_UNITS
+that are still running;
+.IP \(bu 2
+containers named in
+.B BLOCKING_CONTAINERS
+(one-shot backup jobs).
+.RE
+.IP
+By default a running backup aborts the run.
+.B \-\-wait-backups
+waits for it to finish (up to one hour, or
+.B BACKUP_WAIT
+seconds), and
+.B \-\-ignore-backups
+continues anyway.
+.TP
+.B 3. Container discovery
+Lists every running Docker container this node must stop itself, and puts
+each one into a shutdown tier. Swarm tasks are left to the Swarm drain,
+Kubernetes-managed containers are left to
+.BR "kubectl drain" ,
+and containers labelled
+.B safe-power.skip=true
+are left alone.
+.RS
+.TP 10
+.B tier 1
+apps: everything not listed below.
+.TP
+.B tier 2
+data: databases and brokers, matched against
+.BR DB_IMAGES .
+.TP
+.B tier 3
+infra: DNS, reverse proxies, VPN and management tools, matched against
+.BR INFRA_IMAGES .
+.RE
+.IP
+Matching uses the image's own name without registry, owner or tag, so
+.I bitnami/postgresql:16
+is data but
+.I redis_exporter
+is an app. The container label
+.BR safe-power.tier=1 | 2 | 3
+overrides the guess.
+.TP
+.B 4. Kubernetes drain
+Runs
+.B kubectl drain
+.I NODE
+.BR "\-\-ignore-daemonsets \-\-delete-emptydir-data" .
+If the drain fails (for example because of a PodDisruptionBudget or a stuck
+pod), the node is uncordoned and the run aborts without powering off. A worker
+with no
+.B kubectl
+access refuses to continue.
+.TP
+.B 5. Docker shutdown
+Drains the Swarm node if Swarm is active. Then it stops the local containers
+tier by tier: apps, then data, then infra. Apps and infra get
+.B STOP_TIMEOUT
+seconds to stop; data gets
+.B DB_STOP_TIMEOUT
+seconds. A container still running afterwards, or one that had to be killed
+(exit code 137), is reported.
+.TP
+.B 6. Power
+Enables the one-shot unit
+.BR safe-power-restore.service ,
+runs
+.BR sync ,
+then reboots or powers off.
+.B \-\-drain
+stops here without a power action.
+.TP
+.B 7. Restore
+Runs at the next boot, or when started with
+.BR \-\-restore :
+.RS
+.IP \(bu 2
+Sets the Swarm node active again.
+.IP \(bu 2
+Starts the containers that were running, tier by tier in reverse (infra,
+then data, then apps). Before starting the next tier it waits up to
+.B HEALTH_WAIT
+seconds for containers with a healthcheck to report healthy.
+.IP \(bu 2
+Waits for the Kubernetes node to be
+.BR Ready ,
+then runs
+.BR "kubectl uncordon" .
+.IP \(bu 2
+Waits for Swarm services to converge. On the control plane it also checks
+.BR HEALTH_URLS .
+.RE
+.IP
+When done, the unit removes itself and the result is recorded for
+.BR \-\-status .
+.SH ACTIONS
+.TP
+.B \-\-reboot
+Phases 1\(en6 followed by a reboot; phase 7 runs on boot.
+.TP
+.B \-\-shutdown
+Phases 1\(en6 followed by a power-off; phase 7 runs at the next power-on.
+.TP
+.B \-\-drain
+Phases 1\(en5 only. Undo with
+.BR \-\-restore .
+.TP
+.B \-\-restore
+Phase 7.
+.TP
+.B \-\-status
+Prints one of
+.BR "drained since" ...,
+.BR "ok restored" ...,
+or
+.BR failed ...
+.TP
+.B \-\-check
+Checks the node's setup:
+.BR cluster.conf ,
+the service account, its SSH key, the sudoers rule,
+.B kubectl
+access, and SSH access to every other node.
+.SH OPTIONS
+.TP
+.I NODE
+Run the action on
+.I NODE
+instead of this host. The calling node connects over SSH as the service
+account and runs
+.I NODE's
+own
+.BR safe-power .
+For
+.BR \-\-reboot ,
+the caller waits until
+.I NODE
+reports that its restore is ok or failed.
+.TP
+.B \-\-all
+With
+.BR \-\-reboot :
+a rolling reboot. First it checks that every node is reachable, that none is
+already drained, and that every Kubernetes node is
+.B Ready
+and schedulable. Then it reboots the other workers, then the control plane,
+then this node last. Each node must report ok before the next one starts,
+followed by a pause of
+.B ROLL_PAUSE
+seconds. The rollout stops at the first node that does not come back healthy.
+With
+.B \-\-status
+or
+.BR \-\-check ,
+the action runs on every node.
+.TP
+.BR \-y ", " \-\-yes
+Do not ask for confirmation.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show every step, including the backup findings and the container shutdown
+plan, without changing anything.
+.TP
+.B \-\-no\-wait
+Do not wait for a remote reboot to finish restoring.
+.TP
+.B \-\-wait\-backups
+Wait for running backups to finish instead of aborting.
+.TP
+.B \-\-ignore\-backups
+Continue even though a backup is running.
+.TP
+.BR \-h ", " \-\-help
+Show usage.
+.SH SETUP
+.B safe-power-setup
+.IR NODE ...
+is run once, from any node, as an admin user who has SSH access and
+.B sudo
+on every node. It is safe to run again, for example to add a node. On every
+node it:
+.IP \(bu 2
+installs
+.BR safe-power ,
+.B safe-power-setup
+and this manual page;
+.IP \(bu 2
+writes
+.BR /etc/safe-power/cluster.conf ;
+.IP \(bu 2
+creates the system account
+.B safepower
+with its password locked and an ed25519 key that has no passphrase;
+.IP \(bu 2
+installs a sudoers rule that lets
+.B safepower
+run only
+.B /usr/local/sbin/safe-power
+as root;
+.IP \(bu 2
+adds every node's key to
+.BR authorized_keys ,
+each with
+.B restrict
+and the forced command
+.BR "safe-power \-\-ssh-gate" ,
+and records every node's host key in
+.BR known_hosts .
+.PP
+On the control plane it also creates the Kubernetes ServiceAccount
+.BR kube-system/safe-power .
+Its ClusterRole allows only what drain and uncordon need: nodes get/list/patch;
+pods get/list/delete; pods/eviction create; and get/list on workload
+controllers. The kubeconfig for it is copied to every node.
+.PP
+Options:
+.BI \-\-control-plane " HOST" ,
+.BI \-\-admin " USER" ,
+.BI \-\-user " NAME" ,
+.BI \-\-api-server " URL" ,
+.BR \-\-verify .
+.SH SECURITY
+The service account cannot open a shell. The SSH gate
+.RB ( "safe-power \-\-ssh-gate" )
+accepts only these commands:
+.IP \(bu 2
+.BR true ;
+.IP \(bu 2
+.B safe-power
+with action flags only. A node argument is refused, so a remote call cannot
+hop on to a third node;
+.IP \(bu 2
+.B kubectl get|drain|cordon|uncordon
+with plain arguments.
+.PP
+Anything else is refused and logged to syslog under the tag
+.BR safe-power .
+.SH CONFIGURATION
+The defaults are at the top of the script. They are overridden first by
+.B /etc/safe-power/cluster.conf
+(cluster layout, rewritten by
+.BR safe-power-setup )
+and then by
+.B /etc/safe-power/local.conf
+(your per-node overrides, never touched by setup). Both files are sourced as
+bash.
+.TP
+.B CONTROL_PLANE_HOST, NODES, SVC_USER
+Cluster layout (written by
+.BR safe-power-setup ).
+.TP
+.B BACKUP_PROCS, BACKUP_CMDLINE, BACKUP_IGNORE, BACKUP_UNITS, BLOCKING_CONTAINERS, BACKUP_WAIT
+Backup detection.
+.TP
+.B DB_IMAGES, INFRA_IMAGES, IMAGE_SUFFIXES
+Container tiers.
+.TP
+.B STOP_TIMEOUT, DB_STOP_TIMEOUT, HEALTH_WAIT
+Container stop and start timing.
+.TP
+.B DRAIN_TIMEOUT, CONVERGE_TIMEOUT, ROLL_PAUSE
+Drain, restore and rollout timing.
+.TP
+.B HEALTH_URLS
+URLs that must answer 2xx/3xx after a restore (control plane only).
+.SH FILES
+.TP
+.B /var/log/safe-power.log
+Log of every run on this node, without color codes: preflight findings,
+drain, container stops and restore. A remote run writes to the log on the
+target node, and the calling node logs its side too.
+.TP
+.B journalctl \-u safe-power-restore
+Output of the restore that runs at boot (also appended to the log above).
+.TP
+.B /var/lib/safe-power/
+State:
+.B containers.txt
+(tier and name of each container that was stopped),
+.B drained_at
+(present while the node is drained),
+.B last_result
+(read by
+.BR \-\-status ),
+.BR swarm_node_id .
+.TP
+.B /etc/safe-power/cluster.conf
+Cluster layout. Identical on every node, and rewritten by
+.BR safe-power-setup .
+.TP
+.B /etc/safe-power/local.conf
+Per-node overrides, for example
+.BR HEALTH_URLS ,
+.B BLOCKING_CONTAINERS
+or
+.BR BACKUP_WAIT .
+.TP
+.B /usr/local/share/man/man8/safe-power.8
+This manual page.
+.TP
+.B /etc/safe-power/kubeconfig
+Token for the
+.B safe-power
+Kubernetes ServiceAccount (root:safepower 0640).
+.TP
+.B /etc/sudoers.d/safe-power
+The service account's single sudo rule.
+.TP
+.B /etc/systemd/system/safe-power-restore.service
+Present only while a node is drained.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Aborted (a backup was running, apt was busy, the drain failed, or the user
+declined), or the restore finished with problems.
+.TP
+.B 2
+Usage error.
+.TP
+.B 126
+Command refused by the SSH gate.
+.SH EXAMPLES
+.TP
+Preview what a reboot of this node would do:
+.B safe-power \-\-reboot \-\-dry-run
+.TP
+Reboot a worker from any node and wait until it is back:
+.B safe-power \-\-reboot optiplex-three
+.TP
+Reboot tonight even if a backup is running, after waiting for it to finish:
+.B safe-power \-\-reboot \-\-wait-backups \-y
+.TP
+Rolling reboot of the whole cluster:
+.B safe-power \-\-reboot \-\-all
+.TP
+See every node's state:
+.B safe-power \-\-status \-\-all
+.TP
+Always stop a container last:
+.B docker run \-\-label safe-power.tier=3 ...
+.SH SEE ALSO
+.BR kubectl-drain (1),
+.BR docker-stop (1),
+.BR systemctl (1),
+.BR journalctl (1),
+.BR sudoers (5),
+.BR sshd (8)
+.SH AUTHOR
+Thomas \(em https://github.com/BladerunnerxRC/Linux_Shell_Scripts

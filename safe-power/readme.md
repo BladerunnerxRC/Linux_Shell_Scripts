@@ -2,17 +2,20 @@
 
 ![bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)
 ![kubernetes](https://img.shields.io/badge/kubernetes-drain%20%2F%20uncordon-326CE5?logo=kubernetes&logoColor=white)
-![docker](https://img.shields.io/badge/docker-swarm%20%2B%20standalone-2496ED?logo=docker&logoColor=white)
+![docker](https://img.shields.io/badge/docker-tiered%20shutdown-2496ED?logo=docker&logoColor=white)
+![backups](https://img.shields.io/badge/backups-detected%20first-D97706)
 ![systemd](https://img.shields.io/badge/systemd-restore%20on%20boot-FF6F00?logo=linux&logoColor=white)
 ![runs from](https://img.shields.io/badge/runs%20from-any%20node-8A2BE2)
 ![rolling](https://img.shields.io/badge/rolling%20reboot-all%20nodes-1a7f37)
+![man](https://img.shields.io/badge/man-safe--power(8)-555)
 
-Safe **reboot / shutdown** for the optiplex cluster: drain first, power second, and put everything back automatically on boot. Run it on any node, and point it at any node.
+Safe **reboot / shutdown** for the optiplex cluster. It never powers off during a backup, drains Kubernetes, stops Docker containers in a safe order, and puts everything back automatically on boot. Run it on any node, and point it at any node.
 
-| Script | Purpose |
+| File | Purpose |
 |---|---|
-| 🟢 **`safe-power`** | Drain, then reboot or shut down, then restore. |
-| 🔵 **`safe-power-setup`** | One-time setup: service account, SSH keys, sudo rule, and Kubernetes permissions on every node. |
+| 🟢 **`safe-power`** | Detect backups, drain, then reboot or shut down, then restore. |
+| 🔵 **`safe-power-setup`** | One-time setup: service account, SSH keys, sudo rule, Kubernetes permissions, and the man page on every node. |
+| 📖 **`safe-power.8`** | Man page: `man safe-power` |
 
 ---
 
@@ -34,14 +37,16 @@ cd Linux_Shell_Scripts/safe-power
 ./safe-power-setup optiplex-docker optiplex-two optiplex-three
 ```
 
-**3. Done ✅** Setup ends by verifying every node. To re-check later:
+**3. Done ✅** Setup ends by verifying every node. Then:
 
 ```bash
-safe-power-setup --verify
+man safe-power                    # full reference
+safe-power --reboot --dry-run     # see what a reboot of this node would do
+safe-power-setup --verify         # re-check the setup any time
 ```
 
 > [!TIP]
-> **Adding a node later:** re-run setup with the full list. It is safe to re-run: it keeps existing keys and adds whatever is new.
+> **Adding a node later:** re-run setup with the full list. It is safe to re-run: it keeps existing keys and never touches `local.conf`.
 > ```bash
 > safe-power-setup optiplex-docker optiplex-two optiplex-three optiplex-four
 > ```
@@ -62,15 +67,17 @@ safe-power-setup --verify
 ### 🔐 What setup creates on every node
 
 ```diff
-+ /usr/local/sbin/safe-power            the tool
-+ /usr/local/sbin/safe-power-setup      the installer (so it can be re-run from any node)
-+ /etc/safe-power/cluster.conf          node list + control plane (identical on all nodes)
-+ user  safepower                       system account, password locked, key-only login
-+ /home/safepower/.ssh/id_ed25519       passphrase-less key (unique per node)
-+ /home/safepower/.ssh/authorized_keys  every node's key, locked to the safe-power SSH gate
-+ /home/safepower/.ssh/known_hosts      every node's host key (no trust-on-first-use)
-+ /etc/sudoers.d/safe-power             safepower may run ONLY /usr/local/sbin/safe-power as root
-+ /etc/safe-power/kubeconfig            Kubernetes ServiceAccount token (root:safepower 0640)
++ /usr/local/sbin/safe-power                  the tool
++ /usr/local/sbin/safe-power-setup            the installer (so it can be re-run from any node)
++ /usr/local/share/man/man8/safe-power.8      man safe-power
++ /etc/safe-power/cluster.conf                node list + control plane (identical everywhere, rewritten by setup)
++ /etc/safe-power/local.conf                  YOUR per-node overrides (created once, never overwritten)
++ user  safepower                             system account, password locked, key-only login
++ /home/safepower/.ssh/id_ed25519             passphrase-less key (unique per node)
++ /home/safepower/.ssh/authorized_keys        every node's key, locked to the safe-power SSH gate
++ /home/safepower/.ssh/known_hosts            every node's host key (no trust-on-first-use)
++ /etc/sudoers.d/safe-power                   safepower may run ONLY /usr/local/sbin/safe-power as root
++ /etc/safe-power/kubeconfig                  Kubernetes ServiceAccount token (root:safepower 0640)
 ```
 
 **Kubernetes** (created on the control plane): ServiceAccount `kube-system/safe-power` bound to ClusterRole `safe-power`, which has only what `kubectl drain` / `uncordon` need:
@@ -85,7 +92,7 @@ safe-power-setup --verify
 > [!NOTE]
 > **Locked down by design.** Each `safepower` key uses `restrict` and a forced command (`safe-power --ssh-gate`). That means no shell, no port forwarding, and no pty. The gate lets through only:
 > - `true`
-> - `safe-power --<action> [-y] [--dry-run]` (no node argument, so a remote call can't hop on to a third node)
+> - `safe-power --<action> [-y] [--dry-run] [--wait-backups] [--ignore-backups]` (no node argument, so a remote call can't hop on to a third node)
 > - `kubectl get|drain|cordon|uncordon …`
 >
 > Anything else is rejected and logged to syslog.
@@ -107,7 +114,13 @@ safe-power --status --all       # 📊 every node at a glance
 safe-power --check  --all       # 🩺 checks on every node
 ```
 
-Options: `-y` skip the prompt · `--dry-run` show what would happen · `--no-wait` don't wait for a remote reboot to finish
+| Option | Effect |
+|---|---|
+| `-y` | Don't ask for confirmation |
+| `--dry-run` | Show every step, including backup findings and the container shutdown plan, without changing anything |
+| `--no-wait` | Don't wait for a remote reboot to finish restoring |
+| `--wait-backups` | Wait up to 1 h for running backups to finish instead of aborting |
+| `--ignore-backups` | Power off even though a backup is running ⚠️ |
 
 `NODE` defaults to **this host**. It re-runs itself with `sudo`, so you can leave `sudo` off.
 
@@ -142,11 +155,11 @@ flowchart LR
 ```
 
 1. **Preflight:** every node must be reachable and not already drained, and every Kubernetes node must be `Ready` and schedulable. If any node is already cordoned, nothing starts.
-2. **Each other node:** drain → reboot → wait until it reports `ok` (Ready and uncordoned) → wait `ROLL_PAUSE` seconds (default 60) for workloads to settle → next node.
+2. **Each other node:** backup check → drain → reboot → wait until it reports `ok` (Ready and uncordoned) → wait `ROLL_PAUSE` seconds (default 60) for workloads to settle → next node.
 3. **The node you ran it from goes last**, because rebooting it ends the run. Its restore still runs on boot. Check afterwards with `safe-power --status --all`.
 
 > [!WARNING]
-> The rollout **stops at the first node that doesn't come back healthy** and lists the nodes it didn't start. The rest of the cluster stays up. Fix that node (`safe-power --status NODE`, check its log), then run `--all` again.
+> The rollout **stops at the first node that doesn't come back healthy**, or that is in the middle of a backup (unless you add `--wait-backups`). It lists the nodes it didn't start, and the rest of the cluster stays up. Fix that node, then run `--all` again.
 
 ```diff
   == safe-power status — all nodes ==
@@ -164,17 +177,19 @@ The node's role is worked out from its hostname, using `CONTROL_PLANE_HOST` in `
 
 ```mermaid
 flowchart LR
-    A([safe-power --reboot]):::start --> B{Preflight<br/>apt / backup-job}
-    B -- busy --> X([abort]):::bad
-    B -- ok --> C[kubectl drain]:::drain
+    A([safe-power --reboot]):::start --> B{1. apt busy?}
+    B -- yes --> X([abort]):::bad
+    B -- no --> K{2. backup<br/>running?}
+    K -- yes --> KW[abort / wait /<br/>ignore]:::bad
+    K -- no --> L[3. discover<br/>containers + tiers]:::drain
+    L --> C[4. kubectl drain]:::drain
     C -- fails --> U[uncordon + abort<br/>nothing powered off]:::bad
-    C -- ok --> D[Swarm drain +<br/>stop containers]:::drain
-    D --> E[arm restore unit<br/>sync]:::power
+    C -- ok --> D[5. Swarm drain +<br/>stop apps → data → infra]:::drain
+    D --> E[6. arm restore unit<br/>sync]:::power
     E --> F((reboot)):::power
-    F --> G[wait for Ready]:::restore
-    G --> H[kubectl uncordon]:::restore
-    H --> I[restart containers<br/>health checks]:::restore
-    I --> J([✅ healthy]):::good
+    F --> G[7. start infra → data → apps<br/>wait healthy]:::restore
+    G --> H[Ready → uncordon<br/>health checks]:::restore
+    H --> J([✅ healthy]):::good
 
     classDef start fill:#6f42c1,color:#fff,stroke:#6f42c1
     classDef drain fill:#0969da,color:#fff,stroke:#0969da
@@ -184,39 +199,129 @@ flowchart LR
     classDef bad fill:#cf222e,color:#fff,stroke:#cf222e
 ```
 
-| Step | 🟣 Control plane (`optiplex-docker`) | 🔵 Worker (`optiplex-three`, …) |
+| Phase | 🟣 Control plane (`optiplex-docker`) | 🔵 Worker (`optiplex-three`, …) |
 |---|---|---|
-| **1. Drain** | `kubectl drain` self, drain the Swarm node, stop standalone containers | `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data` |
-| **2. Power** | `sync`, then reboot or power off | `sync`, then reboot or power off |
-| **3. Restore** *(on boot)* | wait for Ready → `kubectl uncordon`, restart containers, wait for Swarm services, check `HEALTH_URLS` | wait for Ready → `kubectl uncordon` |
+| **1. Preflight** | abort if `apt`/`dpkg` is running | same |
+| **2. Backups** | abort / wait if a backup is running | same |
+| **3. Discover** | list local containers and assign tiers | same |
+| **4. Kubernetes** | `kubectl drain` self | `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data` |
+| **5. Docker** | Swarm drain, then stop containers by tier | stop containers by tier |
+| **6. Power** | `sync`, then reboot or power off | same |
+| **7. Restore** *(on boot)* | start containers by tier → Ready → `kubectl uncordon` → Swarm services → `HEALTH_URLS` | start containers by tier → Ready → `kubectl uncordon` |
 
-**How it gets `kubectl` access:** it first tries the local `kubectl` (or `k3s kubectl`) with `/etc/safe-power/kubeconfig`. If that doesn't work, it runs `kubectl` on the control plane over the `safepower` SSH connection.
+### 💾 Backup detection (phase 2)
+
+Before touching anything, it looks for a backup in progress on the node:
+
+| Source | Matched by | Examples |
+|---|---|---|
+| 🔍 Processes, **including inside containers** (reported with the container name) | `BACKUP_PROCS` | `restic`, `borg`, `kopia`, `vzdump`, `veeamagent`, `pg_dump`, `mysqldump`, `mariabackup` |
+| 📜 Backup scripts | `BACKUP_CMDLINE` | `backup.sh`, `docker_backup` |
+| ⚙️ systemd services that are still running | `BACKUP_UNITS` | `borgmatic.service`, `restic-backup.service` |
+| 🐳 One-shot backup containers | `BLOCKING_CONTAINERS` | `backup-job` |
+
+Long-running daemons such as `kopia server` and `restic mount` are ignored (`BACKUP_IGNORE`). If a backup is found:
+
+```diff
+- default            abort, nothing is touched
+! --wait-backups     wait up to 1 h (or BACKUP_WAIT seconds), checking every 30 s
+- --ignore-backups   carry on anyway
+```
+
+### 🐳 Container shutdown order (phase 3 + 5)
+
+It finds every running container this node must stop itself. Swarm tasks are left to the Swarm drain, and Kubernetes pods to `kubectl drain`. Containers are stopped in tiers, so apps finish writing before their databases go away:
+
+| Tier | Stopped | Started on boot | What | Timeout |
+|---|---|---|---|---|
+| 🟦 **1 apps** | 1st | 3rd | everything else | `STOP_TIMEOUT` 60 s |
+| 🟨 **2 data** | 2nd | 2nd | postgres, mariadb, mysql, mongo, redis, influxdb, mosquitto, rabbitmq … | `DB_STOP_TIMEOUT` 120 s |
+| 🟥 **3 infra** | 3rd | 1st | pihole, adguard, traefik, caddy, portainer, tailscale, cloudflared … | `STOP_TIMEOUT` 60 s |
+
+- Tiers are guessed from the image's own name, so `bitnami/postgresql:16` is data but `redis_exporter` is an app.
+- On boot, each tier waits (up to `HEALTH_WAIT`) for its containers' healthchecks to pass before the next tier starts.
+- A container that had to be **killed** after its timeout is flagged, because it may not have shut down cleanly.
+
+Override the guess with a container label:
+
+```yaml
+labels:
+  safe-power.tier: "2"      # treat as a database
+  # safe-power.skip: "true" # never stop this one
+```
 
 ### 🛡️ Safety checks
 
-- 🚫 Refuses to run while `apt`/`dpkg` or the `backup-job` container is running.
+- 🚫 Refuses to run while `apt`/`dpkg` is running, or while a **backup** is running.
 - ↩️ If `kubectl drain` fails (a PodDisruptionBudget or a stuck pod), it **uncordons and aborts**, and nothing is powered off.
 - 🚫 A worker with no `kubectl` access refuses to power off while still undrained.
+- 🐢 Databases get more time to stop, and are stopped after the apps that use them.
 - ⚠️ Warns before shutting down the control plane.
 - 🧹 The restore step is a one-shot systemd unit (`safe-power-restore.service`) that removes itself when it's done.
 
 ---
 
+## 📜 Logs
+
+| Where | What |
+|---|---|
+| **`/var/log/safe-power.log`** | Everything on **the node doing the work**: backup findings, container plan, drain, stops, restore. Plain text, no color codes. |
+| Caller's `/var/log/safe-power.log` | For remote and `--all` runs, the calling node logs its side (what it sent, the waits) too |
+| `journalctl -u safe-power-restore` | The restore that runs at boot (also appended to the log above) |
+| `journalctl -t safe-power` | Commands the SSH gate rejected |
+
+```bash
+tail -f /var/log/safe-power.log                                  # follow a run
+ssh optiplex-three tail -n 50 /var/log/safe-power.log            # another node (with your own account)
+journalctl -u safe-power-restore -b                              # this boot's restore
+```
+
 ## 📁 Files
 
 | Path | What |
 |---|---|
-| `/var/log/safe-power.log` | Log of every run, drain and restore |
-| `/var/lib/safe-power/` | State: containers that were running, `drained_at`, `last_result` |
-| `/etc/safe-power/cluster.conf` | Node list, control plane, service account name |
+| `/var/lib/safe-power/` | State: `containers.txt` (tier + name), `drained_at`, `last_result`, `swarm_node_id` |
+| `/etc/safe-power/cluster.conf` | Node list, control plane, service account. Rewritten by setup |
+| `/etc/safe-power/local.conf` | **Your overrides for this node.** Never overwritten |
 
-Settings such as `HEALTH_URLS`, timeouts and `BLOCKING_CONTAINERS` are at the top of `safe-power`. Any of them can be overridden in `cluster.conf`.
+Every setting at the top of `safe-power` can be overridden in `local.conf`. For example:
+
+```bash
+# /etc/safe-power/local.conf on optiplex-docker
+HEALTH_URLS=("http://localhost:7171" "http://localhost:3000" "http://localhost:8080")
+BLOCKING_CONTAINERS=("backup-job" "nightly-dump")
+BACKUP_WAIT=1800
+DB_STOP_TIMEOUT=180
+```
 
 ## 🩹 Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `✘ ssh safepower → nodeX` | Run `safe-power-setup --verify`. Check that the hostname resolves, and check `AllowUsers` in `sshd_config`. |
-| `✘ kubectl access` | Re-run setup with `--api-server https://<control-plane-ip>:6443`. |
-| Node left cordoned after boot | `safe-power --status NODE`, check the log on that node, then `safe-power --restore NODE`. |
-| Host key changed (node rebuilt) | Re-run `safe-power-setup` with all nodes. |
+| `💾 Backup in progress` but nothing is backing up | Check the listed process. Add it to `BACKUP_IGNORE` in `local.conf`, or use `--ignore-backups` once |
+| `⚠️ X didn't stop within 60s and was killed` | Give it more time: label it `safe-power.tier=2` (120 s), or raise `STOP_TIMEOUT` |
+| Container in the wrong tier | Add the label `safe-power.tier=1`, `2` or `3` |
+| `✘ ssh safepower → nodeX` | Run `safe-power-setup --verify`. Check that the hostname resolves, and check `AllowUsers` in `sshd_config` |
+| `✘ kubectl access` | Re-run setup with `--api-server https://<control-plane-ip>:6443` |
+| Node left cordoned after boot | `safe-power --status NODE`, check the log on that node, then `safe-power --restore NODE` |
+| Host key changed (node rebuilt) | Re-run `safe-power-setup` with all nodes |
+
+---
+
+## 🗺️ Roadmap
+
+| | Idea | Why |
+|---|---|---|
+| ⏻ | **`--shutdown --all`**: workers → control plane → this node, without waiting | One command for a power outage; a UPS (NUT `SHUTDOWNCMD`) can trigger it |
+| 🎯 | **`--all --workers-only`** | Patch the workers without touching the control plane |
+| 🔔 | **Notifications** (ntfy / Home Assistant webhook) on drain, restore ok/failed, and each rollout step | Know the result without SSHing in |
+| ⏱️ | **Rollout time cap** (`ROLL_MAX`) | A stuck node can't hold a maintenance window open forever |
+| 🚧 | **One node down at a time**: refuse to drain if another node is already cordoned (not only with `--all`) | Two people, or two cron jobs, can't take out two workers at once |
+| 🔑 | **`from="<node IPs>"`** on each `authorized_keys` entry | A copied `safepower` key is useless from any other machine |
+| 📂 | **Check the NFS backup mount** after restore | Otherwise `backup.sh` quietly writes to the local disk when the NAS mount is missing |
+| 🗓️ | **Maintenance window** (`--at 03:00`, via `systemd-run --on-calendar`) | Schedule a rolling reboot without cron |
+| 🩺 | **Pre-reboot kernel check**: skip the reboot if `/var/run/reboot-required` is absent (`--if-needed`) | Nightly `--all --if-needed` reboots only the nodes that need it |
+| 🧪 | **shellcheck + bats tests** in GitHub Actions | Catch regressions before they reach the cluster |
+| 📖 | **Merge the v1 `COMMAND_scripts/safe-power`** once smiddleware moves to v2 | One `safe-power` command on every host |
+
+See `man safe-power` for the full reference.
