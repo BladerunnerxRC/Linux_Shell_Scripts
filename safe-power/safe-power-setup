@@ -93,11 +93,11 @@ EOF
   fi
   install -m 644 "$key.pub" "$CONF_DIR/$u.pub"
   # this node's addresses — other nodes accept its key only from these (from=)
-  if command -v ip >/dev/null; then
-    ip -o addr show scope global | awk '{sub(/\/.*/, "", $4); print $4}'
-  else
-    hostname -I 2>/dev/null | tr ' ' '\n'
-  fi | awk 'NF' | sort -u | paste -sd, - > "$CONF_DIR/$u.addrs"
+  # (ip first; hostname -I whenever ip is missing, fails, or finds nothing)
+  local addrs=""
+  command -v ip >/dev/null && addrs=$(ip -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}')
+  [ -n "$addrs" ] || addrs=$(hostname -I 2>/dev/null | tr ' ' '\n')
+  awk 'NF' <<<"$addrs" | sort -u | paste -sd, - > "$CONF_DIR/$u.addrs"
   chmod 644 "$CONF_DIR/$u.addrs"
   ok "addresses: $(cat "$CONF_DIR/$u.addrs")"
 
@@ -273,6 +273,15 @@ CONTROL_PLANE_HOST=${CONTROL_PLANE_HOST:-optiplex-docker}
 SVC_USER=${SVC_USER:-safepower}
 [[ " ${NODES[*]} " == *" $CONTROL_PLANE_HOST "* ]] || NODES=("$CONTROL_PLANE_HOST" "${NODES[@]}")
 [ ${#NODES[@]} -ge 1 ] || usage 2
+# Validate before anything is written (cluster.conf is also quoted, but a bad
+# value is better caught here with a clear message)
+for n in "${NODES[@]}" "$CONTROL_PLANE_HOST" "$SVC_USER"; do
+  [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid node or user name: '$n'"
+done
+[[ "$SSH_FROM" =~ ^[01]$ ]] || die "SSH_FROM must be 0 or 1 (got '$SSH_FROM')"
+SSH_FROM_EXTRA=$(tr -d ' ' <<<"$SSH_FROM_EXTRA")
+[[ "$SSH_FROM_EXTRA" =~ ^[0-9A-Fa-f.:/,]*$ ]] \
+  || die "--from-extra takes only IP addresses and CIDRs, comma-separated (got '$SSH_FROM_EXTRA')"
 SELF=$(hostname -s)
 [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ] && warn "Running as root: bootstrap SSH will be as root. Prefer your admin user."
 
@@ -334,17 +343,19 @@ for n in "${NODES[@]}"; do
   fi
 done
 
-cat > "$WORK/cluster.conf" <<EOF
-# /etc/safe-power/cluster.conf — written by safe-power-setup on $(date '+%F %T') from $SELF
-# Identical on every node. Re-run safe-power-setup to change it.
-CONTROL_PLANE_HOST="$CONTROL_PLANE_HOST"
-NODES=(${NODES[*]})
-SVC_USER="$SVC_USER"
-NOTIFY_NTFY_URL="$NOTIFY_NTFY_URL"
-NOTIFY_HA_WEBHOOK="$NOTIFY_HA_WEBHOOK"
-SSH_FROM=$SSH_FROM
-SSH_FROM_EXTRA="$SSH_FROM_EXTRA"
-EOF
+# cluster.conf is sourced as bash by root on every node: every value is written
+# with printf %q so nothing in it (quotes, $( ), ;) can run as code.
+{
+  echo "# /etc/safe-power/cluster.conf — written by safe-power-setup on $(date '+%F %T') from $SELF"
+  echo "# Identical on every node. Re-run safe-power-setup to change it."
+  printf 'CONTROL_PLANE_HOST=%q\n' "$CONTROL_PLANE_HOST"
+  printf 'NODES=(%s)\n' "$(printf '%q ' "${NODES[@]}" | sed 's/ $//')"
+  printf 'SVC_USER=%q\n' "$SVC_USER"
+  printf 'NOTIFY_NTFY_URL=%q\n' "$NOTIFY_NTFY_URL"
+  printf 'NOTIFY_HA_WEBHOOK=%q\n' "$NOTIFY_HA_WEBHOOK"
+  printf 'SSH_FROM=%q\n' "$SSH_FROM"
+  printf 'SSH_FROM_EXTRA=%q\n' "$SSH_FROM_EXTRA"
+} > "$WORK/cluster.conf"
 
 # ---------------------------------------------------------------- 1. account + key
 step "1/4  Service account, passphrase-less key, sudoers on every node"

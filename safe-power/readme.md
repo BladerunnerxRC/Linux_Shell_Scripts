@@ -419,7 +419,7 @@ labels:
 - 🔒 **One node down at a time:** refuses to drain while another node is cordoned or `NotReady`.
 - 🚨 A reboot or shutdown of the whole cluster (`--all`) shows a **blinking red warning** and needs a typed `yes`.
 - ⏱️ Rolling reboots have a **time limit** (`ROLL_MAX`, default 4 h).
-- 📂 After boot, **required mounts** (e.g. the NAS backup share) must be up **before** any container starts.
+- 📂 After boot, **required mounts** (e.g. the NAS backup share) must be up **before** any container starts. If one is missing, the node stays drained until it is fixed.
 - 🔑 Each node's SSH key only works **from that node's own IP addresses** (`from=`).
 - ⚠️ Warns before shutting down the control plane.
 - 🧹 The restore step is a one-shot systemd unit (`safe-power-restore.service`) that removes itself when it's done.
@@ -469,7 +469,7 @@ DB_STOP_TIMEOUT=180
 | Container in the wrong tier | Add the label `safe-power.tier=1`, `2` or `3` |
 | `✘ ssh safepower → nodeX` | Run `safe-power-setup --verify`. Check that the hostname resolves, and check `AllowUsers` in `sshd_config` |
 | `✘ kubectl access` | Re-run setup with `--api-server https://<control-plane-ip>:6443` |
-| `❌ /mnt/… is NOT mounted` after boot | Check the NAS and `/etc/fstab`, then `mount /mnt/…` and `safe-power --restore` |
+| `🛑 Not starting containers or uncordoning` after boot (mount missing) | The node is left drained on purpose. Check the NAS and `/etc/fstab`, run `mount /mnt/…`, then `safe-power --restore` |
 | `✘ ssh safepower → nodeX` after a node's IP changed | Re-run `safe-power-setup`: the `from=` addresses are taken at setup time |
 | Node left cordoned after boot | `safe-power --status NODE`, check the log on that node, then `safe-power --restore NODE` |
 | Host key changed (node rebuilt) | Re-run `safe-power-setup` with all nodes |
