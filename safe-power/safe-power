@@ -484,7 +484,7 @@ ConditionPathExists=${STATE_DIR}/drained_at
 [Service]
 Type=oneshot
 ExecStart=${SCRIPT_PATH} --restore
-TimeoutStartSec=$((CONVERGE_TIMEOUT * 2 + 120))
+TimeoutStartSec=$(restore_budget)
 
 [Install]
 WantedBy=multi-user.target
@@ -507,6 +507,18 @@ EOF
       notify warn "Powering off" "$NODE_NAME $how and is powering off. Restore runs at next power-on."
       log "💾 sync"; run sync; ok "⏻  Powering off $NODE_NAME"; run systemctl poweroff ;;
   esac
+}
+
+# restore_budget — worst-case seconds restore() can legitimately take, so the
+# systemd unit's TimeoutStartSec never kills a slow-but-progressing restore
+restore_budget() {
+  local urls=0
+  [ "$ROLE" = "control-plane" ] && urls=${#HEALTH_URLS[@]}
+  echo $(( 120 \
+    + MOUNT_WAIT * ${#REQUIRED_MOUNTS[@]} \
+    + HEALTH_WAIT * 3 \
+    + CONVERGE_TIMEOUT * (2 + urls) \
+    + 300 ))   # docker wait + mounts + 3 tiers + (k8s + swarm + each URL) + margin
 }
 
 # ============================================================ PHASE 3
@@ -998,7 +1010,7 @@ schedule_at() {
 
   hdr "Schedule: safe-power ${args[*]}"
   log "🗓️  At $(date -d "@$target" '+%a %F %T') (in $(dur $((target - now))))"
-  if [ "$ALL" -eq 1 ] && [ "$ACTION" != "drain" ]; then
+  if [ "$ALL" -eq 1 ]; then   # (--drain --all is rejected before we get here)
     local -a who=()
     build_order; who=("${ORDER[@]}")
     confirm_all "SCHEDULED ${ACTION^^}$([ "$IF_NEEDED" -eq 1 ] && echo " (ONLY IF NEEDED)")" "${who[@]}"
