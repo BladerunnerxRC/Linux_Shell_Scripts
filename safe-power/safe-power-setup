@@ -286,7 +286,7 @@ run_verify() {
 if [ "$VERIFY_ONLY" -eq 1 ]; then run_verify; exit $?; fi
 
 for f in safe-power safe-power-setup; do
-  [ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f not found — run from the safe-boot folder"
+  [ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f not found — run from the safe-power folder"
 done
 
 # ---------------------------------------------------------------- 0. reachability

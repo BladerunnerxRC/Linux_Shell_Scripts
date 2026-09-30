@@ -1,10 +1,11 @@
-# ⚡ safe-boot — `safe-power`
+# ⚡ safe-power
 
 ![bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)
 ![kubernetes](https://img.shields.io/badge/kubernetes-drain%20%2F%20uncordon-326CE5?logo=kubernetes&logoColor=white)
 ![docker](https://img.shields.io/badge/docker-swarm%20%2B%20standalone-2496ED?logo=docker&logoColor=white)
 ![systemd](https://img.shields.io/badge/systemd-restore%20on%20boot-FF6F00?logo=linux&logoColor=white)
 ![runs from](https://img.shields.io/badge/runs%20from-any%20node-8A2BE2)
+![rolling](https://img.shields.io/badge/rolling%20reboot-all%20nodes-1a7f37)
 
 Safe **reboot / shutdown** for the optiplex cluster: drain first, power second, and put everything back automatically on boot. Run it on any node, and point it at any node.
 
@@ -24,7 +25,7 @@ Safe **reboot / shutdown** for the optiplex cluster: drain first, power second, 
 
 ```bash
 git clone https://github.com/BladerunnerxRC/Linux_Shell_Scripts.git
-cd Linux_Shell_Scripts/safe-boot
+cd Linux_Shell_Scripts/safe-power
 ```
 
 **2. Run setup with every node's hostname** (the control plane is `optiplex-docker` by default)
@@ -100,6 +101,10 @@ safe-power --drain    [NODE]    # 🚰 drain only
 safe-power --restore  [NODE]    # ♻️  bring a drained node back (runs automatically on boot)
 safe-power --status   [NODE]    # 📊 drained / ok / failed
 safe-power --check    [NODE]    # 🩺 verify account, SSH trust, kubectl
+
+safe-power --reboot --all       # 🔄 rolling reboot of the whole cluster
+safe-power --status --all       # 📊 every node at a glance
+safe-power --check  --all       # 🩺 checks on every node
 ```
 
 Options: `-y` skip the prompt · `--dry-run` show what would happen · `--no-wait` don't wait for a remote reboot to finish
@@ -117,6 +122,39 @@ safe-power --status optiplex-docker
 ```
 
 The work always runs **on the target node itself**: the calling node connects over SSH as `safepower` and runs that node's own `safe-power`. For a remote `--reboot`, the calling node waits until the target reports its restore is `ok` or `failed`.
+
+### 🔄 Rolling reboot: `--all`
+
+```bash
+safe-power --reboot --all --dry-run   # preview the order
+safe-power --reboot --all             # do it
+```
+
+Nodes are rebooted **one at a time**, in this order:
+
+```mermaid
+flowchart LR
+    P{{Preflight}}:::check --> W1[worker 1]:::worker --> W2[worker 2 …]:::worker --> CP[control plane]:::cp --> S[this node<br/>last]:::self
+    classDef check fill:#6f42c1,color:#fff,stroke:#6f42c1
+    classDef worker fill:#0969da,color:#fff,stroke:#0969da
+    classDef cp fill:#bf8700,color:#fff,stroke:#bf8700
+    classDef self fill:#1a7f37,color:#fff,stroke:#1a7f37
+```
+
+1. **Preflight:** every node must be reachable and not already drained, and every Kubernetes node must be `Ready` and schedulable. If any node is already cordoned, nothing starts.
+2. **Each other node:** drain → reboot → wait until it reports `ok` (Ready and uncordoned) → wait `ROLL_PAUSE` seconds (default 60) for workloads to settle → next node.
+3. **The node you ran it from goes last**, because rebooting it ends the run. Its restore still runs on boot. Check afterwards with `safe-power --status --all`.
+
+> [!WARNING]
+> The rollout **stops at the first node that doesn't come back healthy** and lists the nodes it didn't start. The rest of the cluster stays up. Fix that node (`safe-power --status NODE`, check its log), then run `--all` again.
+
+```diff
+  == safe-power status — all nodes ==
++   ✔ optiplex-docker      ok restored 2026-09-30 01:12:40
++   ✔ optiplex-two         ok restored 2026-09-30 00:58:03
+    ● optiplex-three       drained since 2026-09-30 01:14:22
+-   ✘ optiplex-four        failed 1 problem(s) 2026-09-30 00:41:10
+```
 
 ---
 

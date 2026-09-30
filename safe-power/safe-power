@@ -9,6 +9,12 @@
 #   safe-power --status   [NODE]   drained / ok / failed
 #   safe-power --check    [NODE]   verify service account, SSH trust, kubectl
 #
+#   safe-power --reboot --all      rolling reboot: other workers → control
+#                                  plane → this node last; one at a time,
+#                                  stops if a node doesn't come back healthy
+#   safe-power --status --all      status of every node
+#   safe-power --check  --all      run checks on every node
+#
 #   NODE defaults to this host. Any node can target any other node; the work
 #   runs on NODE itself over SSH as the safepower service account.
 #
@@ -40,6 +46,7 @@ BLOCKING_CONTAINERS=("backup-job")            # refuse to run while these run
 STOP_TIMEOUT=60           # seconds per container for graceful stop
 DRAIN_TIMEOUT=300         # seconds for kubectl drain / swarm tasks to leave
 CONVERGE_TIMEOUT=600      # seconds to wait after boot for Ready/services/health
+ROLL_PAUSE=60             # --all: seconds to let workloads settle between nodes
 CONF_DIR="/etc/safe-power"
 STATE_DIR="/var/lib/safe-power"
 LOG_FILE="/var/log/safe-power.log"
@@ -71,7 +78,7 @@ err()  { log "${RED}$*${RST}"; }
 hdr()  { echo "${CYN}${BLD}== $* ==${RST}"; }
 die()  { err "❌ $*"; exit 1; }
 run()  { if [ "$DRY_RUN" -eq 1 ]; then log "${YLW}DRY-RUN:${RST} $*"; else "$@"; fi; }
-usage() { sed -n '2,26p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,29p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ------------------------------------------------------------ service-account SSH
 svc_ready() { [ -n "$SVC_HOME" ] && [ -f "$SVC_HOME/.ssh/id_ed25519" ]; }
@@ -393,8 +400,30 @@ wait_for_restore() {
   err "❌ Timed out waiting for $n. Check: safe-power --status $n"; return 1
 }
 
+# remote_action NODE — run $ACTION on NODE (no prompt); returns non-zero on failure
+remote_action() {
+  local n=$1 rc args=("--$ACTION")
+  case "$ACTION" in reboot|shutdown|drain|restore) args+=(-y) ;; esac
+  [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
+
+  log "📡 $NODE_NAME → $n: safe-power ${args[*]}"
+  svc_ssh "$n" safe-power "${args[@]}"; rc=$?
+
+  case "$ACTION" in
+    reboot)
+      # 255 = connection dropped by the reboot
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ]; then err "❌ safe-power on $n failed (rc=$rc)."; return 1; fi
+      [ "$DRY_RUN" -eq 1 ] || [ "$NO_WAIT" -eq 1 ] && return 0
+      wait_for_restore "$n" ;;
+    shutdown)
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ]; then err "❌ safe-power on $n failed (rc=$rc)."; return 1; fi
+      ok "⏻  $n is powering off. Restore runs automatically at next power-on." ;;
+    *) return "$rc" ;;
+  esac
+}
+
 remote_dispatch() {
-  local n=$TARGET rc args=("--$ACTION")
+  local n=$TARGET
   if [ ${#NODES[@]} -gt 0 ] && [[ " ${NODES[*]} " != *" $n "* ]]; then
     die "'$n' is not in NODES (${NODES[*]}). Add it with safe-power-setup."
   fi
@@ -406,34 +435,93 @@ remote_dispatch() {
       if [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
         read -r -p "Proceed with ${ACTION^^} of ${n} (from $NODE_NAME)? [y/N] " ans
         [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted by user."
-      fi
-      args+=(-y) ;;
+      fi ;;
   esac
-  [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
+  remote_action "$n"; exit $?
+}
 
-  log "📡 $NODE_NAME → $n: safe-power ${args[*]}"
-  svc_ssh "$n" safe-power "${args[@]}"; rc=$?
+# ============================================================ --all
+node_status() { if [ "$1" = "$NODE_NAME" ]; then status; else svc_ssh "$1" safe-power --status 2>/dev/null || echo "unreachable"; fi; }
 
-  case "$ACTION" in
-    reboot)
-      # 255 = connection dropped by the reboot
-      [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ] && die "safe-power on $n failed (rc=$rc)."
-      [ "$DRY_RUN" -eq 1 ] || [ "$NO_WAIT" -eq 1 ] && exit 0
-      wait_for_restore "$n"; exit $? ;;
-    shutdown)
-      [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ] && die "safe-power on $n failed (rc=$rc)."
-      ok "⏻  $n is powering off. Restore runs automatically at next power-on."; exit 0 ;;
-    *) exit "$rc" ;;
-  esac
+status_all() {
+  local n
+  hdr "safe-power status — all nodes"
+  for n in "${NODES[@]}"; do
+    local st; st=$(node_status "$n")
+    case "$st" in
+      ok*)      printf '  %s✔%s %-20s %s\n' "$GRN" "$RST" "$n" "$st" ;;
+      drained*) printf '  %s●%s %-20s %s\n' "$YLW" "$RST" "$n" "$st" ;;
+      *)        printf '  %s✘%s %-20s %s\n' "$RED" "$RST" "$n" "$st" ;;
+    esac
+  done
+}
+
+check_all() {
+  local n f=0
+  for n in "${NODES[@]}"; do
+    if [ "$n" = "$NODE_NAME" ]; then check || f=$((f + 1))
+    else svc_ssh "$n" safe-power --check || f=$((f + 1)); fi
+  done
+  return "$f"
+}
+
+# Rolling reboot: other workers → control plane → this node last.
+# Stops at the first node that doesn't come back healthy.
+rolling_all() {
+  local n i=0 order=() bad
+  svc_ready || die "No $SVC_USER SSH key on $NODE_NAME. Run safe-power-setup."
+  for n in "${NODES[@]}"; do
+    [ "$n" = "$CONTROL_PLANE_HOST" ] || [ "$n" = "$NODE_NAME" ] || order+=("$n")
+  done
+  [ "$CONTROL_PLANE_HOST" != "$NODE_NAME" ] && [[ " ${NODES[*]} " == *" $CONTROL_PLANE_HOST "* ]] && order+=("$CONTROL_PLANE_HOST")
+  [[ " ${NODES[*]} " == *" $NODE_NAME "* ]] && order+=("$NODE_NAME")
+
+  hdr "Rolling reboot from $NODE_NAME: ${order[*]}"
+
+  # Preflight: every node reachable, none already drained, cluster fully Ready + schedulable
+  for n in "${order[@]}"; do
+    if [ "$n" != "$NODE_NAME" ]; then
+      svc_ssh "$n" true 2>/dev/null || die "Can't reach $SVC_USER@$n. Fix before a rolling reboot (safe-power --check --all)."
+    fi
+    [[ "$(node_status "$n")" == drained* ]] && die "$n is already drained. Run: safe-power --restore $n"
+  done
+  if kube_detect; then
+    bad=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null | awk '$2 != "Ready" {print $1" ("$2")"}')
+    [ -n "$bad" ] && die "Not all nodes are Ready + schedulable: $(tr '\n' ' ' <<<"$bad")— fix or uncordon first."
+    ok "✅ All Kubernetes nodes Ready and schedulable"
+  else
+    warn "⚠️  kubectl not reachable from $NODE_NAME; skipping cluster-wide Ready check."
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+    read -r -p "Rolling REBOOT of ${#order[@]} node(s): ${order[*]}? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted by user."
+  fi
+
+  NO_WAIT=0
+  for n in "${order[@]}"; do
+    i=$((i + 1))
+    hdr "[$i/${#order[@]}] $n"
+    if [ "$n" = "$NODE_NAME" ]; then
+      log "🔁 This node goes last; its restore runs on boot. Check later: safe-power --status --all"
+      ASSUME_YES=1; drain_and_power; return
+    fi
+    remote_action "$n" || die "Rollout stopped: $n didn't come back healthy. Not started: ${order[*]:$i}"
+    if [ "$i" -lt "${#order[@]}" ] && [ "$DRY_RUN" -ne 1 ]; then
+      log "😴 Letting workloads settle for ${ROLL_PAUSE}s"; sleep "$ROLL_PAUSE"
+    fi
+  done
+  ok "🎉 Rolling reboot complete: ${order[*]}"
 }
 
 # ============================================================ main
 [ "${1:-}" = "--ssh-gate" ] && ssh_gate
 
-ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0
+ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0; ALL=0
 for arg in "$@"; do
   case "$arg" in
     --reboot|--shutdown|--drain|--restore|--status|--check) ACTION="${arg#--}" ;;
+    --all)        ALL=1 ;;
     -y|--yes)     ASSUME_YES=1 ;;
     -n|--dry-run) DRY_RUN=1 ;;
     --no-wait)    NO_WAIT=1 ;;
@@ -451,7 +539,16 @@ if [ "$(id -u)" -ne 0 ]; then
   exec sudo -- "$SCRIPT_PATH" "$@"
 fi
 
-if [ -z "$TARGET" ]; then
+if [ "$ALL" -eq 1 ]; then
+  [ -z "$TARGET" ] || die "Use either NODE or --all, not both."
+  [ ${#NODES[@]} -gt 0 ] || die "NODES is empty in $CONF_DIR/cluster.conf. Run safe-power-setup."
+  case "$ACTION" in
+    status) status_all; exit 0 ;;
+    check)  check_all;  exit $? ;;
+    reboot) ;;
+    *) die "--all works with --reboot, --status and --check." ;;
+  esac
+elif [ -z "$TARGET" ]; then
   case "$ACTION" in
     status) status; exit 0 ;;
     check)  check;  exit $? ;;
@@ -462,6 +559,7 @@ mkdir -p "$STATE_DIR"
 # Log to file without color codes
 exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
+if [ "$ALL" -eq 1 ]; then rolling_all; exit $?; fi
 if [ -n "$TARGET" ]; then remote_dispatch; fi
 case "$ACTION" in
   restore) restore ;;
