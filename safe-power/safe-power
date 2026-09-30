@@ -87,9 +87,11 @@ MOUNT_WAIT=120            # seconds to wait for each required mount after boot
 REBOOT_REQUIRED_FILE="/var/run/reboot-required"   # Debian / Ubuntu
 BOOT_DIR="/boot"                                  # newest vmlinuz-* vs the running kernel
 
-# --- Notifications (blank = off). Set cluster-wide with safe-power-setup --ntfy / --ha-webhook.
+# --- Notifications (blank = off). Set cluster-wide with safe-power-setup --ntfy /
+# --ntfy-token / --ha-webhook; stored in root-only /etc/safe-power/notify.conf (0600),
+# because a webhook URL or topic is effectively a password.
 NOTIFY_NTFY_URL=""        # e.g. https://ntfy.sh/my-cluster  or  http://ntfy.lan/safe-power
-NOTIFY_NTFY_TOKEN=""      # ntfy access token, if the topic needs one (put it in local.conf)
+NOTIFY_NTFY_TOKEN=""      # ntfy access token, if the topic needs one
 NOTIFY_HA_WEBHOOK=""      # e.g. http://homeassistant.lan:8123/api/webhook/safe-power
 CONF_DIR="/etc/safe-power"
 STATE_DIR="/var/lib/safe-power"
@@ -98,9 +100,12 @@ UNIT_NAME="safe-power-restore.service"
 UNIT_FILE="/etc/systemd/system/${UNIT_NAME}"
 SCRIPT_PATH="$(readlink -f "$0")"
 
-# cluster.conf is rewritten by safe-power-setup; put per-node overrides in local.conf
+# cluster.conf and notify.conf are rewritten by safe-power-setup; put per-node
+# overrides in local.conf (read last). notify.conf and local.conf are root-only (0600).
 # shellcheck source=/dev/null
 [ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
+# shellcheck source=/dev/null
+[ -r "$CONF_DIR/notify.conf" ] && . "$CONF_DIR/notify.conf"
 # shellcheck source=/dev/null
 [ -r "$CONF_DIR/local.conf" ] && . "$CONF_DIR/local.conf"
 
@@ -489,15 +494,17 @@ EOF
   fi
 
   # 2. Power action
+  local how="drained"
+  [ "$NO_EVICT" -eq 1 ] && how="cordoned (cluster shutdown, pods not evicted)"
   case "$ACTION" in
     drain)
       ok "✅ Drained. Run 'safe-power --restore' to bring $NODE_NAME back."
-      notify info "Drained" "$NODE_NAME is drained. Bring it back with: safe-power --restore $NODE_NAME" ;;
+      notify info "Drained" "$NODE_NAME is $how. Bring it back with: safe-power --restore $NODE_NAME" ;;
     reboot)
-      notify info "Rebooting" "$NODE_NAME drained cleanly and is rebooting."
+      notify info "Rebooting" "$NODE_NAME $how cleanly and is rebooting."
       log "💾 sync"; run sync; ok "🔁 Rebooting $NODE_NAME"; run systemctl reboot ;;
     shutdown)
-      notify warn "Powering off" "$NODE_NAME drained and is powering off. Restore runs at next power-on."
+      notify warn "Powering off" "$NODE_NAME $how and is powering off. Restore runs at next power-on."
       log "💾 sync"; run sync; ok "⏻  Powering off $NODE_NAME"; run systemctl poweroff ;;
   esac
 }
@@ -677,14 +684,16 @@ wait_for_restore() {
   # a rollout's time limit caps the wait too
   [ -n "${ROLL_DEADLINE:-}" ] && [ "$ROLL_DEADLINE" -lt "$deadline" ] && deadline=$ROLL_DEADLINE
   log "⏳ Waiting for $n to reboot and restore (Ctrl+C stops waiting; restore still runs on $n)"
-  sleep 20
+  # nap SECS — sleep, but never past the deadline
+  nap() { local left=$((deadline - SECONDS)); [ "$left" -gt 0 ] && sleep $(( left < $1 ? left : $1 )); return 0; }
+  nap 20
   while [ "$SECONDS" -lt "$deadline" ]; do
     st=$(svc_ssh "$n" safe-power --status 2>/dev/null) || st="unreachable"
     case "$st" in
       ok*)     ok "✅ $n is back: $st"; return 0 ;;
       failed*) err "❌ $n restore: $st (see $LOG_FILE on $n)"; return 1 ;;
     esac
-    sleep 15
+    nap 15
   done
   err "❌ Timed out waiting for $n. Check: safe-power --status $n"; return 1
 }
@@ -908,8 +917,14 @@ shutdown_all() {
     notify fail "Cluster shutdown problems" "$fails node(s) did not shut down cleanly; see $LOG_FILE on $NODE_NAME."
   fi
   if [ -n "$self" ]; then
+    # this node still powers off (it's a power outage), but the exit status reports the failures
     hdr "This node: $self"
-    ASSUME_YES=1; drain_and_power; return
+    ASSUME_YES=1; drain_and_power || return 1
+    [ "$fails" -eq 0 ] || return 1
+    return 0
+  fi
+  if [ "$fails" -gt 0 ]; then
+    err "❌ Cluster shutdown finished with $fails node(s) that did not shut down cleanly."; return 1
   fi
   ok "⏻  Cluster shutdown sent to all selected nodes."
 }
