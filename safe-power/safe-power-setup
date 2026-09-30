@@ -11,6 +11,8 @@
 #   --admin USER           SSH user for the bootstrap    (default: you)
 #   --user NAME            service account name          (default: safepower)
 #   --api-server URL       API URL workers should use    (default: from admin kubeconfig)
+#   --ntfy URL             ntfy topic for notifications  (kept on re-run; "" = off)
+#   --ha-webhook URL       Home Assistant webhook URL    (kept on re-run; "" = off)
 #
 # On every node it:
 #   1. installs safe-power + safe-power-setup to /usr/local/sbin, and the
@@ -233,7 +235,7 @@ esac
 
 # ============================================================ orchestrator
 CONTROL_PLANE_HOST=""; ADMIN="${SUDO_USER:-$(id -un)}"; SVC_USER=""; API=""; VERIFY_ONLY=0
-NODES=()
+NODES=(); NOTIFY_NTFY_URL=""; NOTIFY_HA_WEBHOOK=""
 # shellcheck source=/dev/null
 [ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
 CLI_NODES=()
@@ -243,6 +245,8 @@ while [ $# -gt 0 ]; do
     --admin)         ADMIN=$2; shift ;;
     --user)          SVC_USER=$2; shift ;;
     --api-server)    API=$2; shift ;;
+    --ntfy)          NOTIFY_NTFY_URL=$2; shift ;;      # "" to turn off
+    --ha-webhook)    NOTIFY_HA_WEBHOOK=$2; shift ;;    # "" to turn off
     --verify)        VERIFY_ONLY=1 ;;
     -h|--help)       usage 0 ;;
     -*) echo "Unknown option: $1" >&2; usage 2 ;;
@@ -262,6 +266,7 @@ echo "${CYN}${BLD}safe-power-setup${RST}"
 info "nodes:         ${BLD}${NODES[*]}${RST}"
 info "control plane: ${BLD}$CONTROL_PLANE_HOST${RST}"
 info "service acct:  ${BLD}$SVC_USER${RST}   bootstrap as: ${BLD}$ADMIN${RST}   running on: ${BLD}$SELF${RST}"
+info "notify:        ntfy ${BLD}${NOTIFY_NTFY_URL:-off}${RST}   Home Assistant ${BLD}${NOTIFY_HA_WEBHOOK:-off}${RST}"
 
 WORK=$(mktemp -d)
 CTL="$WORK/ctl"; mkdir -p "$CTL"
@@ -320,6 +325,8 @@ cat > "$WORK/cluster.conf" <<EOF
 CONTROL_PLANE_HOST="$CONTROL_PLANE_HOST"
 NODES=(${NODES[*]})
 SVC_USER="$SVC_USER"
+NOTIFY_NTFY_URL="$NOTIFY_NTFY_URL"
+NOTIFY_HA_WEBHOOK="$NOTIFY_HA_WEBHOOK"
 EOF
 
 # ---------------------------------------------------------------- 1. account + key

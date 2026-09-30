@@ -60,6 +60,8 @@ safe-power-setup --verify         # re-check the setup any time
 | `--admin USER` | you | SSH user used during setup |
 | `--user NAME` | `safepower` | Service account name |
 | `--api-server URL` | from admin kubeconfig | API URL for workers to use (needed if the admin kubeconfig points at `127.0.0.1`) |
+| `--ntfy URL` | off | ntfy topic for notifications on every node (kept on re-run, `""` turns it off) |
+| `--ha-webhook URL` | off | Home Assistant webhook for notifications on every node (kept on re-run, `""` turns it off) |
 | `--verify` | | Only run the checks |
 
 </details>
@@ -92,7 +94,7 @@ safe-power-setup --verify         # re-check the setup any time
 > [!NOTE]
 > **Locked down by design.** Each `safepower` key uses `restrict` and a forced command (`safe-power --ssh-gate`). That means no shell, no port forwarding, and no pty. The gate lets through only:
 > - `true`
-> - `safe-power --<action> [-y] [--dry-run] [--wait-backups] [--ignore-backups]` (no node argument, so a remote call can't hop on to a third node)
+> - `safe-power --<action> [-y] [--dry-run] [--wait-backups] [--ignore-backups] [--no-evict] [--allow-concurrent]` (no node argument, so a remote call can't hop on to a third node)
 > - `kubectl get|drain|cordon|uncordon …`
 >
 > Anything else is rejected and logged to syslog.
@@ -109,18 +111,23 @@ safe-power --restore  [NODE]    # ♻️  bring a drained node back (runs automa
 safe-power --status   [NODE]    # 📊 drained / ok / failed
 safe-power --check    [NODE]    # 🩺 verify account, SSH trust, kubectl
 
-safe-power --reboot --all       # 🔄 rolling reboot of the whole cluster
-safe-power --status --all       # 📊 every node at a glance
-safe-power --check  --all       # 🩺 checks on every node
+safe-power --reboot   --all     # 🔄 rolling reboot of the whole cluster
+safe-power --shutdown --all     # 🔌 power off the whole cluster (UPS / outage)
+safe-power --status   --all     # 📊 every node at a glance
+safe-power --check    --all     # 🩺 checks on every node
+#  … add --workers-only to any --all command to leave the control plane alone
 ```
 
 | Option | Effect |
 |---|---|
-| `-y` | Don't ask for confirmation |
+| `-y` | Don't ask for confirmation (the red `--all` warning is still shown) |
 | `--dry-run` | Show every step, including backup findings and the container shutdown plan, without changing anything |
 | `--no-wait` | Don't wait for a remote reboot to finish restoring |
 | `--wait-backups` | Wait up to 1 h for running backups to finish instead of aborting |
 | `--ignore-backups` | Power off even though a backup is running ⚠️ |
+| `--workers-only` | With `--all`: leave the control plane out |
+| `--max-time=MIN` | With `--reboot --all`: don't start another node after `MIN` minutes (default 240, `0` = no limit) |
+| `--allow-concurrent` | Skip the one-node-down lock ⚠️ |
 
 `NODE` defaults to **this host**. It re-runs itself with `sudo`, so you can leave `sudo` off.
 
@@ -139,8 +146,18 @@ The work always runs **on the target node itself**: the calling node connects ov
 ### 🔄 Rolling reboot: `--all`
 
 ```bash
-safe-power --reboot --all --dry-run   # preview the order
-safe-power --reboot --all             # do it
+safe-power --reboot --all --dry-run                  # preview the order
+safe-power --reboot --all                            # do it
+safe-power --reboot --all --workers-only --max-time=120   # workers only, 2-hour limit
+```
+
+Every `--all` reboot or shutdown starts with a **blinking red warning** that lists the nodes, and you have to type `yes`:
+
+```diff
+-  ⚠  ROLLING REBOOT OF 4 NODE(S): optiplex-two optiplex-three optiplex-docker optiplex-four  ⚠
+-  This affects the whole cluster, starting from optiplex-four.
+
+   Type yes to continue: _
 ```
 
 Nodes are rebooted **one at a time**, in this order:
@@ -159,7 +176,7 @@ flowchart LR
 3. **The node you ran it from goes last**, because rebooting it ends the run. Its restore still runs on boot. Check afterwards with `safe-power --status --all`.
 
 > [!WARNING]
-> The rollout **stops at the first node that doesn't come back healthy**, or that is in the middle of a backup (unless you add `--wait-backups`). It lists the nodes it didn't start, and the rest of the cluster stays up. Fix that node, then run `--all` again.
+> The rollout **stops** at the first node that doesn't come back healthy, or that is in the middle of a backup (unless you add `--wait-backups`), or once the **time limit** is reached (`ROLL_MAX`, default 4 h). It lists the nodes it didn't start, and the rest of the cluster stays up. Fix the problem, then run `--all` again.
 
 ```diff
   == safe-power status — all nodes ==
@@ -168,6 +185,105 @@ flowchart LR
     ● optiplex-three       drained since 2026-09-30 01:14:22
 -   ✘ optiplex-four        failed 1 problem(s) 2026-09-30 00:41:10
 ```
+
+### 🔌 Cluster shutdown: `--shutdown --all`
+
+For a power outage, or for a UPS to trigger:
+
+```bash
+safe-power --shutdown --all --dry-run                   # preview
+safe-power --shutdown --all                             # asks you to type yes
+/usr/local/sbin/safe-power --shutdown --all -y --ignore-backups   # unattended (UPS)
+```
+
+```mermaid
+flowchart LR
+    W[workers<br/>in parallel]:::worker --> CP[control plane]:::cp --> S[this node<br/>last]:::self
+    classDef worker fill:#0969da,color:#fff,stroke:#0969da
+    classDef cp fill:#bf8700,color:#fff,stroke:#bf8700
+    classDef self fill:#cf222e,color:#fff,stroke:#cf222e
+```
+
+- **Fast:** workers shut down **at the same time**. Nodes are cordoned, **not drained**, because there's nowhere left to move the pods.
+- **Still clean:** each node still checks for backups (unless you add `--ignore-backups`) and stops its containers in order: apps, then data, then infra.
+- **Best effort:** an unreachable node (probably already off) is skipped, and one node failing doesn't stop the others from powering off.
+- **Restore** runs on each node at its next power-on, as usual.
+
+<details>
+<summary>🔋 NUT (Network UPS Tools) example</summary>
+
+On the node that talks to the UPS, `/etc/nut/upsmon.conf`:
+
+```ini
+SHUTDOWNCMD "/usr/local/sbin/safe-power --shutdown --all -y --ignore-backups"
+FINALDELAY 0
+```
+
+The other nodes don't need NUT: `safe-power` powers them off over SSH.
+
+</details>
+
+### 🔒 One node down at a time
+
+Before draining, a node **cordons itself and then checks every other node**. If another node is already cordoned or `NotReady`, it uncordons itself and stops:
+
+```diff
+- ❌ Not draining optiplex-three: optiplex-two (Ready,SchedulingDisabled) is already cordoned or NotReady.
+-    Bring it back first, or use --allow-concurrent.
+```
+
+This protects you from two people, or two cron jobs, taking down two workers at once. Because each node takes the lock **before** checking, two nodes that start at the same moment both back off; neither goes down. Turn it off for good with `ONE_AT_A_TIME=0` in `local.conf`, or skip it once with `--allow-concurrent`.
+
+### 🔔 Notifications
+
+Get a message on your phone (ntfy) or in Home Assistant when:
+
+| Event | Level |
+|---|---|
+| 🔁 Node rebooting / ⏻ powering off / 🚰 drained | info / warn |
+| ✅ Restored and healthy | ok |
+| ❌ Restore failed | fail |
+| 🛑 Aborted: backup running, drain failed, another node down | fail |
+| 🔄 Rolling reboot started / complete / stopped (failure or time limit) | info / ok / fail |
+| 🔌 Cluster shutdown started / problems | warn / fail |
+
+Turn it on for every node at once:
+
+```bash
+safe-power-setup --ntfy https://ntfy.sh/my-cluster-topic
+safe-power-setup --ha-webhook http://homeassistant.lan:8123/api/webhook/safe-power
+```
+
+<details>
+<summary>📨 Details: ntfy token, Home Assistant automation</summary>
+
+**ntfy with an access token.** Put the token in `/etc/safe-power/local.conf` on each node:
+
+```bash
+NOTIFY_NTFY_TOKEN="tk_..."
+```
+
+Failures are sent with **urgent** priority, so they get past Do Not Disturb.
+
+**Home Assistant** gets a JSON POST: `{"node", "level", "title", "message"}`. Example automation:
+
+```yaml
+automation:
+  - alias: safe-power notifications
+    trigger:
+      - platform: webhook
+        webhook_id: safe-power
+        local_only: true
+    action:
+      - service: notify.mobile_app_my_phone
+        data:
+          title: "safe-power: {{ trigger.json.title }}"
+          message: "[{{ trigger.json.node }}] {{ trigger.json.message }}"
+```
+
+</details>
+
+Notifications never fail a run, and are never sent during `--dry-run`.
 
 ---
 
@@ -256,6 +372,9 @@ labels:
 - ↩️ If `kubectl drain` fails (a PodDisruptionBudget or a stuck pod), it **uncordons and aborts**, and nothing is powered off.
 - 🚫 A worker with no `kubectl` access refuses to power off while still undrained.
 - 🐢 Databases get more time to stop, and are stopped after the apps that use them.
+- 🔒 **One node down at a time:** refuses to drain while another node is cordoned or `NotReady`.
+- 🚨 A reboot or shutdown of the whole cluster (`--all`) shows a **blinking red warning** and needs a typed `yes`.
+- ⏱️ Rolling reboots have a **time limit** (`ROLL_MAX`, default 4 h).
 - ⚠️ Warns before shutting down the control plane.
 - 🧹 The restore step is a one-shot systemd unit (`safe-power-restore.service`) that removes itself when it's done.
 
@@ -312,11 +431,6 @@ DB_STOP_TIMEOUT=180
 
 | | Idea | Why |
 |---|---|---|
-| ⏻ | **`--shutdown --all`**: workers → control plane → this node, without waiting | One command for a power outage; a UPS (NUT `SHUTDOWNCMD`) can trigger it |
-| 🎯 | **`--all --workers-only`** | Patch the workers without touching the control plane |
-| 🔔 | **Notifications** (ntfy / Home Assistant webhook) on drain, restore ok/failed, and each rollout step | Know the result without SSHing in |
-| ⏱️ | **Rollout time cap** (`ROLL_MAX`) | A stuck node can't hold a maintenance window open forever |
-| 🚧 | **One node down at a time**: refuse to drain if another node is already cordoned (not only with `--all`) | Two people, or two cron jobs, can't take out two workers at once |
 | 🔑 | **`from="<node IPs>"`** on each `authorized_keys` entry | A copied `safepower` key is useless from any other machine |
 | 📂 | **Check the NFS backup mount** after restore | Otherwise `backup.sh` quietly writes to the local disk when the NAS mount is missing |
 | 🗓️ | **Maintenance window** (`--at 03:00`, via `systemd-run --on-calendar`) | Schedule a rolling reboot without cron |

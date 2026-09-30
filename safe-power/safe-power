@@ -9,18 +9,24 @@
 #   safe-power --status   [NODE]   drained / ok / failed
 #   safe-power --check    [NODE]   verify service account, SSH trust, kubectl
 #
-#   safe-power --reboot --all      rolling reboot: other workers → control
+#   safe-power --reboot   --all    rolling reboot: other workers → control
 #                                  plane → this node last; one at a time,
 #                                  stops if a node doesn't come back healthy
-#   safe-power --status --all      status of every node
-#   safe-power --check  --all      run checks on every node
+#                                  or the time limit (--max-time) is reached
+#   safe-power --shutdown --all    cluster power-off (UPS): workers in
+#                                  parallel → control plane → this node
+#   safe-power --status   --all    status of every node
+#   safe-power --check    --all    run checks on every node
+#   add --workers-only to any --all command to leave the control plane alone
 #
 #   NODE defaults to this host. Any node can target any other node; the work
 #   runs on NODE itself over SSH as the safepower service account.
 #
 #   Options: -y/--yes (no prompt), -n/--dry-run, --no-wait (don't wait for a
 #            remote reboot to finish restoring), --wait-backups (wait up to
-#            1h for running backups), --ignore-backups, -h/--help
+#            1h for running backups), --ignore-backups, --max-time=MINUTES
+#            (--all time limit, default 240), --allow-concurrent (skip the
+#            one-node-down lock), -h/--help
 #
 #   Log: /var/log/safe-power.log on the node doing the work.  man safe-power
 #
@@ -64,6 +70,13 @@ HEALTH_WAIT=120           # restore: seconds to wait for a tier's healthchecks b
 DRAIN_TIMEOUT=300         # seconds for kubectl drain / swarm tasks to leave
 CONVERGE_TIMEOUT=600      # seconds to wait after boot for Ready/services/health
 ROLL_PAUSE=60             # --all: seconds to let workloads settle between nodes
+ROLL_MAX=14400            # --all: don't start another node after this many seconds (0 = no limit)
+ONE_AT_A_TIME=1           # refuse to drain while another Kubernetes node is cordoned / NotReady
+
+# --- Notifications (blank = off). Set cluster-wide with safe-power-setup --ntfy / --ha-webhook.
+NOTIFY_NTFY_URL=""        # e.g. https://ntfy.sh/my-cluster  or  http://ntfy.lan/safe-power
+NOTIFY_NTFY_TOKEN=""      # ntfy access token, if the topic needs one (put it in local.conf)
+NOTIFY_HA_WEBHOOK=""      # e.g. http://homeassistant.lan:8123/api/webhook/safe-power
 CONF_DIR="/etc/safe-power"
 STATE_DIR="/var/lib/safe-power"
 LOG_FILE="/var/log/safe-power.log"
@@ -87,9 +100,9 @@ elif command -v k3s >/dev/null; then KUBECTL=(k3s kubectl); fi
 
 # ------------------------------------------------------------ output
 if [ -t 1 ]; then
-  RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' CYN=$'\e[36m' BLD=$'\e[1m' RST=$'\e[0m'
+  RED=$'\e[31m' GRN=$'\e[32m' YLW=$'\e[33m' BLU=$'\e[34m' CYN=$'\e[36m' BLD=$'\e[1m' BLINK=$'\e[5m' RST=$'\e[0m'
 else
-  RED="" GRN="" YLW="" BLU="" CYN="" BLD="" RST=""
+  RED="" GRN="" YLW="" BLU="" CYN="" BLD="" BLINK="" RST=""
 fi
 log()  { echo "${BLU}[$(date '+%F %T')]${RST} $*"; }
 ok()   { log "${GRN}$*${RST}"; }
@@ -98,6 +111,48 @@ err()  { log "${RED}$*${RST}"; }
 hdr()  { echo "${CYN}${BLD}== $* ==${RST}"; }
 die()  { err "❌ $*"; exit 1; }
 run()  { if [ "$DRY_RUN" -eq 1 ]; then log "${YLW}DRY-RUN:${RST} $*"; else "$@"; fi; }
+
+# ------------------------------------------------------------ notifications
+dur() { if [ "$1" -ge 120 ]; then echo "$(( $1 / 60 )) min"; else echo "${1}s"; fi; }
+json_esc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; printf '%s' "$s"; }
+
+# notify LEVEL TITLE MESSAGE — LEVEL: info|ok|warn|fail. Best effort; never fails the run.
+notify() {
+  local level=$1 title=$2 msg=$3 prio=default tags=information_source
+  [ "${DRY_RUN:-0}" -eq 1 ] && return 0
+  case "$level" in
+    ok)   tags=white_check_mark ;;
+    warn) prio=high;   tags=warning ;;
+    fail) prio=urgent; tags=rotating_light ;;
+  esac
+  if [ -n "$NOTIFY_NTFY_URL" ]; then
+    local -a h=(-H "Title: safe-power: $title" -H "Priority: $prio" -H "Tags: $tags")
+    [ -n "$NOTIFY_NTFY_TOKEN" ] && h+=(-H "Authorization: Bearer $NOTIFY_NTFY_TOKEN")
+    curl -fsS -m 10 "${h[@]}" -d "[$NODE_NAME] $msg" "$NOTIFY_NTFY_URL" >/dev/null 2>&1 \
+      || warn "⚠️  ntfy notification failed ($NOTIFY_NTFY_URL)"
+  fi
+  if [ -n "$NOTIFY_HA_WEBHOOK" ]; then
+    curl -fsS -m 10 -H 'Content-Type: application/json' \
+      -d "{\"node\":\"$(json_esc "$NODE_NAME")\",\"level\":\"$level\",\"title\":\"$(json_esc "$title")\",\"message\":\"$(json_esc "$msg")\"}" \
+      "$NOTIFY_HA_WEBHOOK" >/dev/null 2>&1 || warn "⚠️  Home Assistant notification failed"
+  fi
+  return 0
+}
+
+# abort TITLE MESSAGE — notify, then die
+abort() { notify fail "$1" "$2"; die "$2"; }
+
+# confirm_all WHAT NODE... — blinking red banner for whole-cluster actions; asks for "yes"
+confirm_all() {
+  local what=$1; shift
+  echo
+  echo "  ${BLINK}${RED}${BLD}⚠  ${what} OF $# NODE(S): $*  ⚠${RST}"
+  echo "  ${RED}${BLD}This affects the whole cluster, starting from $NODE_NAME.${RST}"
+  echo
+  [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] && return 0
+  read -r -p "  Type yes to continue: " ans
+  [[ "${ans,,}" == "yes" ]] || die "Aborted by user."
+}
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SCRIPT_PATH"; exit "${1:-0}"; }
 
 # ------------------------------------------------------------ service-account SSH
@@ -123,7 +178,11 @@ ssh_gate() {
     true) exit 0 ;;
     safe-power)
       for t in "${w[@]:1}"; do
-        case "$t" in --reboot|--shutdown|--drain|--restore|--status|--check|-y|--yes|-n|--dry-run|--wait-backups|--ignore-backups) ;; *) reject ;; esac
+        case "$t" in
+          --reboot|--shutdown|--drain|--restore|--status|--check|-y|--yes|-n|--dry-run) ;;
+          --wait-backups|--ignore-backups|--no-evict|--allow-concurrent) ;;
+          *) reject ;;
+        esac
       done
       exec sudo -n "$SCRIPT_PATH" "${w[@]:1}" ;;
     kubectl)
@@ -287,12 +346,12 @@ drain_and_power() {
       log "⏳ Waiting up to ${BACKUP_WAIT}s for backups to finish"
       deadline=$((SECONDS + BACKUP_WAIT))
       while backups=$(detect_backups); do
-        [ "$SECONDS" -ge "$deadline" ] && { sed 's/^/     - /' <<<"$backups"; die "Backups still running after ${BACKUP_WAIT}s."; }
+        [ "$SECONDS" -ge "$deadline" ] && { sed 's/^/     - /' <<<"$backups"; abort "Backup still running" "Backups still running after ${BACKUP_WAIT}s; $NODE_NAME was not powered off."; }
         sleep 30
       done
       ok "✅ Backups finished"
     else
-      die "Not powering off during a backup. Re-run with --wait-backups to wait, or --ignore-backups to override."
+      abort "Backup in progress" "Not powering off $NODE_NAME during a backup. Re-run with --wait-backups to wait, or --ignore-backups to override."
     fi
   else
     ok "✅ No running backups detected"
@@ -316,6 +375,8 @@ drain_and_power() {
 
   if kube_detect; then
     log "☸️  kubectl via $KUBE_MODE${KUBE_LOCAL_CFG:+ ($KUBE_LOCAL_CFG)}"
+  elif [ "$NO_EVICT" -eq 1 ]; then
+    warn "⚠️  kubectl not reachable (control plane may already be off); cluster shutdown continues without cordon."
   elif [ "$ROLE" = "worker" ]; then
     die "No kubectl access (local or via $SVC_USER@$CONTROL_PLANE_HOST). Run safe-power-setup. Refusing to power off an undrained worker."
   else
@@ -337,14 +398,33 @@ drain_and_power() {
     date '+%F %T'      > "$STATE_DIR/drained_at"
   fi
 
-  # 1a. Kubernetes drain
-  if [ -n "$KUBE_MODE" ]; then
+  # 1a. One-node-down lock: cordon ourselves first, then look for any other
+  # node that is cordoned or NotReady. Two nodes racing both back off.
+  if [ -n "$KUBE_MODE" ] && [ "$NO_EVICT" -ne 1 ] && [ "$ONE_AT_A_TIME" -eq 1 ] && [ "$ALLOW_CONCURRENT" -ne 1 ]; then
+    log "🔒 One node down at a time: cordoning $NODE_NAME, then checking the other nodes"
+    run kube cordon "$NODE_NAME" >/dev/null
+    local others
+    others=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null \
+             | awk -v me="$NODE_NAME" '$1 != me && $2 != "Ready" {print $1" ("$2")"}')
+    if [ -n "$others" ]; then
+      run kube uncordon "$NODE_NAME" >/dev/null
+      rm -f "$STATE_DIR/drained_at"
+      abort "Another node is down" "Not draining $NODE_NAME: $(tr '\n' ' ' <<<"$others")is already cordoned or NotReady. Bring it back first, or use --allow-concurrent."
+    fi
+    ok "🔓 No other node is down"
+  fi
+
+  # 1b. Kubernetes drain (cluster-wide shutdown: cordon only — nowhere to evict to)
+  if [ -n "$KUBE_MODE" ] && [ "$NO_EVICT" -eq 1 ]; then
+    log "🚧 Cluster shutdown: cordoning $NODE_NAME (no eviction)"
+    run kube cordon "$NODE_NAME" >/dev/null || warn "⚠️  cordon failed; continuing shutdown"
+  elif [ -n "$KUBE_MODE" ]; then
     log "🚰 kubectl drain $NODE_NAME ${DRAIN_ARGS[*]}"
     if ! run kube drain "$NODE_NAME" "${DRAIN_ARGS[@]}" "--timeout=${DRAIN_TIMEOUT}s"; then
       warn "↩️  Drain failed; uncordoning $NODE_NAME"
       kube uncordon "$NODE_NAME" >/dev/null
       rm -f "$STATE_DIR/drained_at"
-      die "kubectl drain failed (PodDisruptionBudget? stuck pod?). Nothing was powered off."
+      abort "Drain failed" "kubectl drain of $NODE_NAME failed (PodDisruptionBudget? stuck pod?). Nothing was powered off."
     fi
   fi
 
@@ -389,9 +469,15 @@ EOF
 
   # 2. Power action
   case "$ACTION" in
-    drain)    ok "✅ Drained. Run 'safe-power --restore' to bring $NODE_NAME back." ;;
-    reboot)   log "💾 sync"; run sync; ok "🔁 Rebooting $NODE_NAME";    run systemctl reboot ;;
-    shutdown) log "💾 sync"; run sync; ok "⏻  Powering off $NODE_NAME"; run systemctl poweroff ;;
+    drain)
+      ok "✅ Drained. Run 'safe-power --restore' to bring $NODE_NAME back."
+      notify info "Drained" "$NODE_NAME is drained. Bring it back with: safe-power --restore $NODE_NAME" ;;
+    reboot)
+      notify info "Rebooting" "$NODE_NAME drained cleanly and is rebooting."
+      log "💾 sync"; run sync; ok "🔁 Rebooting $NODE_NAME"; run systemctl reboot ;;
+    shutdown)
+      notify warn "Powering off" "$NODE_NAME drained and is powering off. Restore runs at next power-on."
+      log "💾 sync"; run sync; ok "⏻  Powering off $NODE_NAME"; run systemctl poweroff ;;
   esac
 }
 
@@ -493,10 +579,12 @@ restore() {
   if [ "$failures" -gt 0 ]; then
     echo "failed $failures problem(s) $(date '+%F %T')" > "$STATE_DIR/last_result"
     warn "⚠️  Restore finished with $failures problem(s). See $LOG_FILE"
+    notify fail "Restore failed" "$NODE_NAME came back with $failures problem(s). See $LOG_FILE on $NODE_NAME."
     exit 1
   fi
   echo "ok restored $(date '+%F %T')" > "$STATE_DIR/last_result"
   ok "🎉 Restore complete — $NODE_NAME is healthy."
+  notify ok "Restored" "$NODE_NAME is back, uncordoned and healthy."
 }
 
 # ============================================================ status / check
@@ -533,6 +621,8 @@ check() {
 # ============================================================ remote target
 wait_for_restore() {
   local n=$1 st deadline=$((SECONDS + CONVERGE_TIMEOUT * 2 + 600))
+  # a rollout's time limit caps the wait too
+  [ -n "${ROLL_DEADLINE:-}" ] && [ "$ROLL_DEADLINE" -lt "$deadline" ] && deadline=$ROLL_DEADLINE
   log "⏳ Waiting for $n to reboot and restore (Ctrl+C stops waiting; restore still runs on $n)"
   sleep 20
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -553,8 +643,10 @@ remote_action() {
   [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
   case "$ACTION" in
     reboot|shutdown|drain)
-      [ "$WAIT_BACKUPS" -eq 1 ]   && args+=(--wait-backups)
-      [ "$IGNORE_BACKUPS" -eq 1 ] && args+=(--ignore-backups) ;;
+      [ "$WAIT_BACKUPS" -eq 1 ]     && args+=(--wait-backups)
+      [ "$IGNORE_BACKUPS" -eq 1 ]   && args+=(--ignore-backups)
+      [ "$NO_EVICT" -eq 1 ]         && args+=(--no-evict)
+      [ "$ALLOW_CONCURRENT" -eq 1 ] && args+=(--allow-concurrent) ;;
   esac
 
   log "📡 $NODE_NAME → $n: safe-power ${args[*]}"
@@ -594,10 +686,35 @@ remote_dispatch() {
 # ============================================================ --all
 node_status() { if [ "$1" = "$NODE_NAME" ]; then status; else svc_ssh "$1" safe-power --status 2>/dev/null || echo "unreachable"; fi; }
 
+# Nodes selected by --all (minus the control plane with --workers-only)
+SELECTED=()
+select_nodes() {
+  local n; SELECTED=()
+  for n in "${NODES[@]}"; do
+    [ "$WORKERS_ONLY" -eq 1 ] && [ "$n" = "$CONTROL_PLANE_HOST" ] && continue
+    SELECTED+=("$n")
+  done
+  [ ${#SELECTED[@]} -gt 0 ] || die "No nodes selected."
+}
+
+# ORDER: other workers → control plane → this node last (the run ends when it goes down)
+ORDER=()
+build_order() {
+  local n; ORDER=()
+  select_nodes
+  for n in "${SELECTED[@]}"; do
+    [ "$n" = "$CONTROL_PLANE_HOST" ] || [ "$n" = "$NODE_NAME" ] || ORDER+=("$n")
+  done
+  [ "$CONTROL_PLANE_HOST" != "$NODE_NAME" ] && [[ " ${SELECTED[*]} " == *" $CONTROL_PLANE_HOST "* ]] && ORDER+=("$CONTROL_PLANE_HOST")
+  [[ " ${SELECTED[*]} " == *" $NODE_NAME "* ]] && ORDER+=("$NODE_NAME")
+  [ ${#ORDER[@]} -gt 0 ] || die "No nodes to act on."
+}
+
 status_all() {
   local n
-  hdr "safe-power status — all nodes"
-  for n in "${NODES[@]}"; do
+  select_nodes
+  hdr "safe-power status — $([ "$WORKERS_ONLY" -eq 1 ] && echo "workers" || echo "all nodes")"
+  for n in "${SELECTED[@]}"; do
     local st; st=$(node_status "$n")
     case "$st" in
       ok*)      printf '  %s✔%s %-20s %s\n' "$GRN" "$RST" "$n" "$st" ;;
@@ -609,7 +726,8 @@ status_all() {
 
 check_all() {
   local n f=0
-  for n in "${NODES[@]}"; do
+  select_nodes
+  for n in "${SELECTED[@]}"; do
     if [ "$n" = "$NODE_NAME" ]; then check || f=$((f + 1))
     else svc_ssh "$n" safe-power --check || f=$((f + 1)); fi
   done
@@ -617,17 +735,15 @@ check_all() {
 }
 
 # Rolling reboot: other workers → control plane → this node last.
-# Stops at the first node that doesn't come back healthy.
+# Stops at the first node that doesn't come back healthy, or at the time limit.
 rolling_all() {
-  local n i=0 order=() bad
+  local n i=0 bad
   svc_ready || die "No $SVC_USER SSH key on $NODE_NAME. Run safe-power-setup."
-  for n in "${NODES[@]}"; do
-    [ "$n" = "$CONTROL_PLANE_HOST" ] || [ "$n" = "$NODE_NAME" ] || order+=("$n")
-  done
-  [ "$CONTROL_PLANE_HOST" != "$NODE_NAME" ] && [[ " ${NODES[*]} " == *" $CONTROL_PLANE_HOST "* ]] && order+=("$CONTROL_PLANE_HOST")
-  [[ " ${NODES[*]} " == *" $NODE_NAME "* ]] && order+=("$NODE_NAME")
+  build_order
+  local -a order=("${ORDER[@]}")
 
-  hdr "Rolling reboot from $NODE_NAME: ${order[*]}"
+  hdr "Rolling reboot ${WORKERS_ONLY_LABEL}from $NODE_NAME: ${order[*]}"
+  [ "$ROLL_MAX" -gt 0 ] && log "⏱️  Time limit: no new node starts after $(dur "$ROLL_MAX")"
 
   # Preflight: every node reachable, none already drained, cluster fully Ready + schedulable
   for n in "${order[@]}"; do
@@ -644,35 +760,98 @@ rolling_all() {
     warn "⚠️  kubectl not reachable from $NODE_NAME; skipping cluster-wide Ready check."
   fi
 
-  if [ "$ASSUME_YES" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
-    read -r -p "Rolling REBOOT of ${#order[@]} node(s): ${order[*]}? [y/N] " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted by user."
-  fi
+  confirm_all "ROLLING REBOOT" "${order[@]}"
+  notify info "Rolling reboot started" "From $NODE_NAME: ${order[*]}"
 
   NO_WAIT=0
+  [ "$ROLL_MAX" -gt 0 ] && ROLL_DEADLINE=$((SECONDS + ROLL_MAX))
   for n in "${order[@]}"; do
+    if [ -n "${ROLL_DEADLINE:-}" ] && [ "$SECONDS" -ge "$ROLL_DEADLINE" ]; then
+      abort "Rolling reboot stopped" "Time limit of $(dur "$ROLL_MAX") reached. Done: ${order[*]:0:$i}. Not started: ${order[*]:$i}"
+    fi
     i=$((i + 1))
     hdr "[$i/${#order[@]}] $n"
     if [ "$n" = "$NODE_NAME" ]; then
       log "🔁 This node goes last; its restore runs on boot. Check later: safe-power --status --all"
+      notify info "Rolling reboot: last node" "Others done; $NODE_NAME reboots now. Its restore reports when it's back."
       ASSUME_YES=1; drain_and_power; return
     fi
-    remote_action "$n" || die "Rollout stopped: $n didn't come back healthy. Not started: ${order[*]:$i}"
+    remote_action "$n" || abort "Rolling reboot stopped" "$n didn't come back healthy. Not started: ${order[*]:$i}"
     if [ "$i" -lt "${#order[@]}" ] && [ "$DRY_RUN" -ne 1 ]; then
       log "😴 Letting workloads settle for ${ROLL_PAUSE}s"; sleep "$ROLL_PAUSE"
     fi
   done
   ok "🎉 Rolling reboot complete: ${order[*]}"
+  notify ok "Rolling reboot complete" "${order[*]}"
+}
+
+# Cluster shutdown (UPS / power outage): workers in parallel → control plane → this node.
+# Cordon only (no eviction: there's nowhere to evict to). Best effort: a failed or
+# unreachable node doesn't stop the rest from powering off.
+shutdown_all() {
+  local n rc fails=0 cp="" self=""
+  local -a workers=() pids=() pnames=()
+  svc_ready || die "No $SVC_USER SSH key on $NODE_NAME. Run safe-power-setup."
+  build_order
+  for n in "${ORDER[@]}"; do
+    if   [ "$n" = "$NODE_NAME" ];          then self=$n
+    elif [ "$n" = "$CONTROL_PLANE_HOST" ]; then cp=$n
+    elif svc_ssh "$n" true 2>/dev/null;    then workers+=("$n")
+    else warn "⚠️  $n unreachable (already off?) — skipping"
+    fi
+  done
+  if [ -n "$cp" ] && ! svc_ssh "$cp" true 2>/dev/null; then
+    warn "⚠️  $cp unreachable (already off?) — skipping"; cp=""
+  fi
+
+  hdr "Cluster SHUTDOWN ${WORKERS_ONLY_LABEL}from $NODE_NAME"
+  log "   1) workers, in parallel: ${workers[*]:-none}"
+  log "   2) control plane:        ${cp:-none}"
+  log "   3) this node, last:      ${self:-none}"
+  confirm_all "SHUTDOWN" ${workers[@]+"${workers[@]}"} ${cp:+"$cp"} ${self:+"$self"}
+  notify warn "Cluster shutdown started" "From $NODE_NAME: ${workers[*]} ${cp} ${self}"
+
+  NO_EVICT=1
+  if [ ${#workers[@]} -gt 0 ]; then
+    hdr "Workers: ${workers[*]}"
+    for n in "${workers[@]}"; do
+      ( remote_action "$n" 2>&1 | sed -u "s/^/[$n] /"; exit "${PIPESTATUS[0]}" ) &
+      pids+=($!); pnames+=("$n")
+    done
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}"; rc=$?
+      [ "$rc" -eq 0 ] || { err "❌ ${pnames[$i]} did not shut down cleanly (rc=$rc)"; fails=$((fails + 1)); }
+    done
+  fi
+  if [ -n "$cp" ]; then
+    hdr "Control plane: $cp"
+    remote_action "$cp" || { err "❌ $cp did not shut down cleanly"; fails=$((fails + 1)); }
+  fi
+  if [ "$fails" -gt 0 ]; then
+    notify fail "Cluster shutdown problems" "$fails node(s) did not shut down cleanly; see $LOG_FILE on $NODE_NAME."
+  fi
+  if [ -n "$self" ]; then
+    hdr "This node: $self"
+    ASSUME_YES=1; drain_and_power; return
+  fi
+  ok "⏻  Cluster shutdown sent to all selected nodes."
 }
 
 # ============================================================ main
 [ "${1:-}" = "--ssh-gate" ] && ssh_gate
 
 ACTION=""; TARGET=""; ASSUME_YES=0; DRY_RUN=0; NO_WAIT=0; ALL=0; WAIT_BACKUPS=0; IGNORE_BACKUPS=0
+WORKERS_ONLY=0; WORKERS_ONLY_LABEL=""; NO_EVICT=0; ALLOW_CONCURRENT=0
 for arg in "$@"; do
   case "$arg" in
     --reboot|--shutdown|--drain|--restore|--status|--check) ACTION="${arg#--}" ;;
     --all)        ALL=1 ;;
+    --workers-only)     WORKERS_ONLY=1; WORKERS_ONLY_LABEL="(workers only) " ;;
+    --max-time=*)
+      [[ "${arg#--max-time=}" =~ ^[0-9]+$ ]] || { echo "--max-time=MINUTES needs a whole number" >&2; usage 2; }
+      ROLL_MAX=$(( ${arg#--max-time=} * 60 )) ;;
+    --no-evict)         NO_EVICT=1 ;;
+    --allow-concurrent) ALLOW_CONCURRENT=1 ;;
     -y|--yes)     ASSUME_YES=1 ;;
     -n|--dry-run) DRY_RUN=1 ;;
     --no-wait)    NO_WAIT=1 ;;
@@ -685,6 +864,7 @@ for arg in "$@"; do
 done
 [ -n "$ACTION" ] || { echo "Choose an action: --reboot --shutdown --drain --restore --status --check" >&2; usage 2; }
 [ "$TARGET" = "$NODE_NAME" ] || [ "$TARGET" = "localhost" ] && TARGET=""
+[ "$WORKERS_ONLY" -eq 1 ] && [ "$ALL" -ne 1 ] && { echo "--workers-only needs --all" >&2; usage 2; }
 
 # Require root: re-exec through sudo (prompts for password if needed)
 if [ "$(id -u)" -ne 0 ]; then
@@ -698,8 +878,8 @@ if [ "$ALL" -eq 1 ]; then
   case "$ACTION" in
     status) status_all; exit 0 ;;
     check)  check_all;  exit $? ;;
-    reboot) ;;
-    *) die "--all works with --reboot, --status and --check." ;;
+    reboot|shutdown) ;;
+    *) die "--all works with --reboot, --shutdown, --status and --check." ;;
   esac
 elif [ -z "$TARGET" ]; then
   case "$ACTION" in
@@ -712,7 +892,10 @@ mkdir -p "$STATE_DIR"
 # Log to file without color codes
 exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
-if [ "$ALL" -eq 1 ]; then rolling_all; exit $?; fi
+if [ "$ALL" -eq 1 ]; then
+  if [ "$ACTION" = "shutdown" ]; then shutdown_all; else rolling_all; fi
+  exit $?
+fi
 if [ -n "$TARGET" ]; then remote_dispatch; fi
 case "$ACTION" in
   restore) restore ;;
