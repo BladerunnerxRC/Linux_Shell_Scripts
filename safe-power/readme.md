@@ -482,7 +482,7 @@ DB_STOP_TIMEOUT=180
 
 ## 🧪 Tests
 
-Every push and PR that touches `safe-power/` runs three checks in GitHub Actions ([workflow](../.github/workflows/safe-power.yml)):
+Every pull request, and every push to `main`, that touches `safe-power/` runs three checks in GitHub Actions ([workflow](../.github/workflows/safe-power.yml)):
 
 | Job | What |
 |---|---|
@@ -495,7 +495,7 @@ Run them locally:
 ```bash
 sudo apt install bats shellcheck mandoc     # or: npm i -g bats
 bats safe-power/tests
-shellcheck -S warning safe-power/safe-power safe-power/safe-power-setup
+shellcheck -S warning safe-power/safe-power safe-power/safe-power-setup safe-power/tests/helper.bash
 ```
 
 > [!NOTE]

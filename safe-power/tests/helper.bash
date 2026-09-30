@@ -7,7 +7,7 @@ REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 setup() {
   H="$BATS_TEST_TMPDIR"
   BIN="$H/bin"
-  SELF="$(hostname -s)"
+  SELF="sp-test-node"   # fixed, so a runner named like a fixture node can't change behaviour
   export H BIN SELF
   mkdir -p "$BIN" "$H/conf" "$H/state" "$H/boot" "$H/mnt/nas"
 
@@ -16,6 +16,7 @@ setup() {
       -e "s#^STATE_DIR=.*#STATE_DIR=$H/state#" \
       -e "s#^LOG_FILE=.*#LOG_FILE=$H/log#" \
       -e "s#^UNIT_FILE=.*#UNIT_FILE=$H/restore.service#" \
+      -e "s#^NODE_NAME=.*#NODE_NAME=\"$SELF\"#" \
       -e 's#^svc_ready() .*#svc_ready() { true; }#' \
       -e 's#^if \[ "$(id -u)" -ne 0 \]; then#if false; then#' \
       "$REPO_DIR/safe-power" > "$H/sp"
