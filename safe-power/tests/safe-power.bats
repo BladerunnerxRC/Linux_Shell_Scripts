@@ -322,3 +322,64 @@ gate() { SSH_ORIGINAL_COMMAND="$1" run "$SP" --ssh-gate; }
   run "$REPO_DIR/safe-power-setup" --bogus
   [ "$status" -eq 2 ]
 }
+
+# ------------------------------------------------------------ review fixes (#2)
+
+@test "restore: missing mount stops before containers and uncordon; node stays drained" {
+  conf "REQUIRED_MOUNTS=(\"$H/mnt/nas\")" 'MOUNT_WAIT=1'
+  printf '1\tjira\n' > "$H/state/containers.txt"
+  date '+%F %T' > "$H/state/drained_at"; sleep 1
+  run "$SP" --restore
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Not starting containers or uncordoning"* ]]
+  refute grep -q "docker start" "$H/docker.log"
+  refute grep -q "uncordon" "$H/kubectl.log"
+  [ -f "$H/state/drained_at" ]
+  run "$SP" --status
+  [[ "$output" == failed*"still drained since"* ]]
+}
+
+@test "restore: a hanging mount is bounded by MOUNT_WAIT" {
+  conf "REQUIRED_MOUNTS=(\"$H/mnt/nas\")" 'MOUNT_WAIT=2'
+  stub mount <<'S'
+sleep 60
+S
+  start=$SECONDS
+  run timeout 30 "$SP" --restore
+  [ "$status" -eq 1 ]
+  [ $((SECONDS - start)) -lt 20 ]
+}
+
+@test "--needs-reboot: an OLDER kernel left in /boot is not a reason" {
+  touch "$H/boot/vmlinuz-0.1.0-old"
+  run "$SP" --needs-reboot
+  [ "$status" -eq 1 ]
+  [ "$output" = "no" ]
+}
+
+@test "--needs-reboot --all: unreachable node shows ?, not no" {
+  DOWN="optiplex-two" run "$SP" --needs-reboot --all
+  [[ "$(plain <<<"$output")" == *"optiplex-two"*"? — unreachable"* ]]
+}
+
+@test "--reboot --all --if-needed: unreachable node aborts before anything starts" {
+  DOWN="optiplex-two" NEED="optiplex-three" run "$SP" --reboot --all --if-needed --dry-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Can't ask optiplex-two"* ]]
+  refute grep -q "safe-power --reboot" "$H/ssh.log"
+}
+
+@test "--at --dry-run says it would schedule, not that it did" {
+  run "$SP" --reboot --at 03:00 --dry-run
+  [[ "$(plain <<<"$output")" == *"DRY-RUN: would schedule"* ]]
+  [[ "$output" != *"Cancel with"* ]]
+}
+
+@test "setup: --from-extra and names are validated" {
+  run "$REPO_DIR/safe-power-setup" --from-extra '10.0.0.1;id' --verify
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"only IP addresses and CIDRs"* ]]
+  run "$REPO_DIR/safe-power-setup" 'node$(id)' --verify
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid node or user name"* ]]
+}

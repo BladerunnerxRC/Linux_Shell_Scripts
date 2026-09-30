@@ -39,8 +39,9 @@ S
   stub ssh <<'S'
 cmd="${*: -1}"; host="${*: -2:1}"; host=${host#*@}
 echo "$host: $cmd" >> "$H/ssh.log"
+[[ " ${DOWN:-} " == *" $host "* ]] && exit 255
 case "$cmd" in
-  true) [[ " ${DOWN:-} " == *" $host "* ]] && exit 255; exit 0 ;;
+  true) exit 0 ;;
   "safe-power --status") echo "ok restored" ;;
   "safe-power --needs-reboot") [[ " ${NEED:-} " == *" $host "* ]] && echo "yes: kernel 6.9 installed" || echo no ;;
   kubectl\ *) exec kubectl ${cmd#kubectl } ;;
