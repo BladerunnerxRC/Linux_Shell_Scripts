@@ -61,6 +61,7 @@ safe-power-setup --verify         # re-check the setup any time
 | `--user NAME` | `safepower` | Service account name |
 | `--api-server URL` | from admin kubeconfig | API URL for workers to use (needed if the admin kubeconfig points at `127.0.0.1`) |
 | `--ntfy URL` | off | ntfy topic for notifications on every node (kept on re-run, `""` turns it off) |
+| `--ntfy-token TOKEN` | | ntfy access token, if your topic needs one (kept on re-run, `""` removes it) |
 | `--ha-webhook URL` | off | Home Assistant webhook for notifications on every node (kept on re-run, `""` turns it off) |
 | `--verify` | | Only run the checks |
 
@@ -73,7 +74,8 @@ safe-power-setup --verify         # re-check the setup any time
 + /usr/local/sbin/safe-power-setup            the installer (so it can be re-run from any node)
 + /usr/local/share/man/man8/safe-power.8      man safe-power
 + /etc/safe-power/cluster.conf                node list + control plane (identical everywhere, rewritten by setup)
-+ /etc/safe-power/local.conf                  YOUR per-node overrides (created once, never overwritten)
++ /etc/safe-power/notify.conf                 ntfy / Home Assistant URLs + token (root-only 0600: they work like passwords)
++ /etc/safe-power/local.conf                  YOUR per-node overrides (created once, never overwritten, root-only 0600)
 + user  safepower                             system account, password locked, key-only login
 + /home/safepower/.ssh/id_ed25519             passphrase-less key (unique per node)
 + /home/safepower/.ssh/authorized_keys        every node's key, locked to the safe-power SSH gate
@@ -257,10 +259,10 @@ safe-power-setup --ha-webhook http://homeassistant.lan:8123/api/webhook/safe-pow
 <details>
 <summary>📨 Details: ntfy token, Home Assistant automation</summary>
 
-**ntfy with an access token.** Put the token in `/etc/safe-power/local.conf` on each node:
+**ntfy with an access token.** Pass it to setup, which stores it with the URLs in root-only `/etc/safe-power/notify.conf` on every node:
 
 ```bash
-NOTIFY_NTFY_TOKEN="tk_..."
+safe-power-setup --ntfy https://ntfy.example/safe-power --ntfy-token tk_...
 ```
 
 Failures are sent with **urgent** priority, so they get past Do Not Disturb.
@@ -401,7 +403,8 @@ journalctl -u safe-power-restore -b                              # this boot's r
 |---|---|
 | `/var/lib/safe-power/` | State: `containers.txt` (tier + name), `drained_at`, `last_result`, `swarm_node_id` |
 | `/etc/safe-power/cluster.conf` | Node list, control plane, service account. Rewritten by setup |
-| `/etc/safe-power/local.conf` | **Your overrides for this node.** Never overwritten |
+| `/etc/safe-power/notify.conf` | Notification URLs + token. Root-only (0600), rewritten by setup |
+| `/etc/safe-power/local.conf` | **Your overrides for this node.** Never overwritten. Root-only (0600) |
 
 Every setting at the top of `safe-power` can be overridden in `local.conf`. For example:
 

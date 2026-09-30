@@ -12,6 +12,7 @@
 #   --user NAME            service account name          (default: safepower)
 #   --api-server URL       API URL workers should use    (default: from admin kubeconfig)
 #   --ntfy URL             ntfy topic for notifications  (kept on re-run; "" = off)
+#   --ntfy-token TOKEN     ntfy access token             (kept on re-run; "" = remove)
 #   --ha-webhook URL       Home Assistant webhook URL    (kept on re-run; "" = off)
 #
 # On every node it:
@@ -69,6 +70,8 @@ node_init() {   # STAGE_DIR — install files, service account, key, sudoers
 #   BACKUP_WAIT=1800
 #   ROLL_PAUSE=120
 EOF
+  # root-only: it's sourced by root and may hold secrets (e.g. a token)
+  chown root:root "$CONF_DIR/local.conf"; chmod 600 "$CONF_DIR/local.conf"
   ok "installed safe-power, safe-power-setup, man page, cluster.conf"
 
   if ! id "$u" >/dev/null 2>&1; then
@@ -121,6 +124,9 @@ node_keys() {   # STAGE_DIR — install authorized_keys / known_hosts / kubeconf
     install -m 640 -o root -g "$u" "$stage/kubeconfig" "$CONF_DIR/kubeconfig"
     ok "kubeconfig installed ($CONF_DIR/kubeconfig)"
   fi
+  # notification endpoints/token are secrets: root-only
+  install -m 600 -o root -g root "$stage/notify.conf" "$CONF_DIR/notify.conf"
+  ok "notify.conf installed (root-only)"
   rm -rf "$stage"
 }
 
@@ -235,18 +241,19 @@ esac
 
 # ============================================================ orchestrator
 CONTROL_PLANE_HOST=""; ADMIN="${SUDO_USER:-$(id -un)}"; SVC_USER=""; API=""; VERIFY_ONLY=0
-NODES=(); NOTIFY_NTFY_URL=""; NOTIFY_HA_WEBHOOK=""
+NODES=(); NOTIFY_NTFY_URL=""; NOTIFY_NTFY_TOKEN=""; NOTIFY_HA_WEBHOOK=""
 # shellcheck source=/dev/null
-[ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"
-CLI_NODES=()
+[ -r "$CONF_DIR/cluster.conf" ] && . "$CONF_DIR/cluster.conf"   # (older versions kept NOTIFY_* here)
+CLI_NODES=(); KEEP="__keep__"; CLI_NTFY=$KEEP; CLI_TOKEN=$KEEP; CLI_HA=$KEEP
 while [ $# -gt 0 ]; do
   case "$1" in
     --control-plane) CONTROL_PLANE_HOST=$2; shift ;;
     --admin)         ADMIN=$2; shift ;;
     --user)          SVC_USER=$2; shift ;;
     --api-server)    API=$2; shift ;;
-    --ntfy)          NOTIFY_NTFY_URL=$2; shift ;;      # "" to turn off
-    --ha-webhook)    NOTIFY_HA_WEBHOOK=$2; shift ;;    # "" to turn off
+    --ntfy)          CLI_NTFY=$2; shift ;;       # "" to turn off
+    --ntfy-token)    CLI_TOKEN=$2; shift ;;      # "" to remove
+    --ha-webhook)    CLI_HA=$2; shift ;;         # "" to turn off
     --verify)        VERIFY_ONLY=1 ;;
     -h|--help)       usage 0 ;;
     -*) echo "Unknown option: $1" >&2; usage 2 ;;
@@ -262,11 +269,26 @@ SVC_USER=${SVC_USER:-safepower}
 SELF=$(hostname -s)
 [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ] && warn "Running as root: bootstrap SSH will be as root. Prefer your admin user."
 
+# Keep the existing notification settings (root-only notify.conf) unless a flag changes them
+if [ "$VERIFY_ONLY" -ne 1 ] && [ -e "$CONF_DIR/notify.conf" ]; then
+  if [ -r "$CONF_DIR/notify.conf" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF_DIR/notify.conf"
+  else
+    # shellcheck source=/dev/null
+    . <(sudo cat "$CONF_DIR/notify.conf") || warn "couldn't read $CONF_DIR/notify.conf; notification settings not kept"
+  fi
+fi
+[ "$CLI_NTFY"  != "$KEEP" ] && NOTIFY_NTFY_URL=$CLI_NTFY
+[ "$CLI_TOKEN" != "$KEEP" ] && NOTIFY_NTFY_TOKEN=$CLI_TOKEN
+[ "$CLI_HA"    != "$KEEP" ] && NOTIFY_HA_WEBHOOK=$CLI_HA
+
 echo "${CYN}${BLD}safe-power-setup${RST}"
 info "nodes:         ${BLD}${NODES[*]}${RST}"
 info "control plane: ${BLD}$CONTROL_PLANE_HOST${RST}"
 info "service acct:  ${BLD}$SVC_USER${RST}   bootstrap as: ${BLD}$ADMIN${RST}   running on: ${BLD}$SELF${RST}"
-info "notify:        ntfy ${BLD}${NOTIFY_NTFY_URL:-off}${RST}   Home Assistant ${BLD}${NOTIFY_HA_WEBHOOK:-off}${RST}"
+# (URLs and token are secrets: only say whether they're set)
+info "notify:        ntfy ${BLD}$([ -n "$NOTIFY_NTFY_URL" ] && echo "on${NOTIFY_NTFY_TOKEN:+ (with token)}" || echo off)${RST}   Home Assistant ${BLD}$([ -n "$NOTIFY_HA_WEBHOOK" ] && echo on || echo off)${RST}"
 
 WORK=$(mktemp -d)
 CTL="$WORK/ctl"; mkdir -p "$CTL"
@@ -327,9 +349,18 @@ done
   printf 'CONTROL_PLANE_HOST=%q\n' "$CONTROL_PLANE_HOST"
   printf 'NODES=(%s)\n' "$(printf '%q ' "${NODES[@]}" | sed 's/ $//')"
   printf 'SVC_USER=%q\n' "$SVC_USER"
-  printf 'NOTIFY_NTFY_URL=%q\n' "$NOTIFY_NTFY_URL"
-  printf 'NOTIFY_HA_WEBHOOK=%q\n' "$NOTIFY_HA_WEBHOOK"
 } > "$WORK/cluster.conf"
+
+# notification endpoints + token: separate root-only file (0600 on every node)
+(
+  umask 077
+  {
+    echo "# /etc/safe-power/notify.conf — written by safe-power-setup; root-only (the URLs work like passwords)"
+    printf 'NOTIFY_NTFY_URL=%q\n' "$NOTIFY_NTFY_URL"
+    printf 'NOTIFY_NTFY_TOKEN=%q\n' "$NOTIFY_NTFY_TOKEN"
+    printf 'NOTIFY_HA_WEBHOOK=%q\n' "$NOTIFY_HA_WEBHOOK"
+  } > "$WORK/notify.conf"
+)
 
 # ---------------------------------------------------------------- 1. account + key
 step "1/4  Service account, passphrase-less key, sudoers on every node"
@@ -370,7 +401,7 @@ fi
 step "4/4  Installing trust + kubeconfig on every node"
 for n in "${NODES[@]}"; do
   echo "  ${BLD}$n${RST}"
-  files=("$WORK/authorized_keys" "$WORK/known_hosts")
+  files=("$WORK/authorized_keys" "$WORK/known_hosts" "$WORK/notify.conf")
   [ -f "$WORK/kubeconfig" ] && files+=("$WORK/kubeconfig")
   push "$n" "${files[@]}"
   as_root "$n" bash "${STAGE[$n]}/safe-power-setup" --node-keys "${STAGE[$n]}" || die "install failed on $n"
