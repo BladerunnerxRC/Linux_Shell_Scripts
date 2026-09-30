@@ -383,3 +383,34 @@ S
   [ "$status" -eq 1 ]
   [[ "$output" == *"Invalid node or user name"* ]]
 }
+
+# ------------------------------------------------------------ review fixes (#1)
+
+@test "notify: URLs are read from root-only notify.conf" {
+  printf 'NOTIFY_NTFY_URL=%q\n' "https://ntfy.example/from-notify-conf" > "$H/conf/notify.conf"
+  TWO_STATE="NotReady" run "$SP" --drain -y
+  grep -q "https://ntfy.example/from-notify-conf" "$H/curl.log"
+}
+
+@test "notify: cluster shutdown says cordoned, not drained" {
+  printf 'NOTIFY_NTFY_URL=%q\n' "https://ntfy.example/t" > "$H/conf/notify.conf"
+  run "$SP" --shutdown -y --no-evict
+  grep -q "cordoned (cluster shutdown, pods not evicted)" "$H/curl.data"
+  refute grep -q "$SELF drained" "$H/curl.data"
+}
+
+@test "--shutdown --all exits 1 when a node fails" {
+  REMOTE_RC=1 run "$SP" --shutdown --all --dry-run
+  [ "$status" -eq 1 ]
+  run "$SP" --shutdown --all --dry-run
+  [ "$status" -eq 0 ]
+}
+
+@test "rollout wait never runs past the time limit" {
+  conf 'ROLL_MAX=3'
+  start=$SECONDS
+  STUCK=1 run "$SP" --reboot --all -y
+  [ "$status" -eq 1 ]
+  [ $((SECONDS - start)) -lt 15 ]
+  [[ "$output" == *"Timed out waiting for optiplex-two"* ]]
+}

@@ -42,7 +42,9 @@ echo "$host: $cmd" >> "$H/ssh.log"
 [[ " ${DOWN:-} " == *" $host "* ]] && exit 255
 case "$cmd" in
   true) exit 0 ;;
-  "safe-power --status") echo "ok restored" ;;
+  "safe-power --status")   # STUCK=1: a node that was sent a reboot never comes back
+    if [ -n "${STUCK:-}" ] && grep -q "^$host: safe-power --reboot" "$H/ssh.log"; then echo "drained since x"
+    else echo "ok restored"; fi ;;
   "safe-power --needs-reboot") [[ " ${NEED:-} " == *" $host "* ]] && echo "yes: kernel 6.9 installed" || echo no ;;
   kubectl\ *) exec kubectl ${cmd#kubectl } ;;
   safe-power\ *) echo "remote $host ran: $cmd"; sleep "${REMOTE_SLEEP:-0}"; exit "${REMOTE_RC:-0}" ;;

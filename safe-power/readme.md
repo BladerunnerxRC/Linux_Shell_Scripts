@@ -487,7 +487,7 @@ Every push and PR that touches `safe-power/` runs three checks in GitHub Actions
 | Job | What |
 |---|---|
 | ✅ **shellcheck** | `shellcheck -S warning` on both scripts and the test helper |
-| ✅ **bats tests** | 51 tests: CLI parsing, the SSH gate (allow and reject), backup detection, container tiers, the one-node lock, notifications (including valid Home Assistant JSON), `--all` order and banner, `--shutdown --all`, the time limit, `--if-needed`, `--at` / `--cancel`, required mounts |
+| ✅ **bats tests** | 55 tests: CLI parsing, the SSH gate (allow and reject), backup detection, container tiers, the one-node lock, notifications (including valid Home Assistant JSON), `--all` order and banner, `--shutdown --all`, the time limit, `--if-needed`, `--at` / `--cancel`, required mounts |
 | ✅ **man page** | `mandoc -T lint` |
 
 Run them locally:
