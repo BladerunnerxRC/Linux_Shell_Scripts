@@ -109,8 +109,14 @@ overrides the guess.
 First it takes the one-node-down lock: the node cordons itself, then checks
 whether any other node is cordoned or
 .BR NotReady .
-If one is, it uncordons itself and aborts, so two nodes are never drained at
-the same time. If two nodes race, both back off. Turn this off with
+If one is, it uncordons itself and aborts. The read requests the most recent
+Kubernetes state. Competing nodes cannot both pass while both remain
+cordoned; either or both may back off. A failed cordon or node-list request,
+or a read that does not confirm this node is cordoned, aborts before drain.
+If rollback cannot uncordon the node, its drained state is kept for recovery
+with
+.BR \-\-restore .
+Turn this check off with
 .B ONE_AT_A_TIME=0
 or skip it once with
 .BR \-\-allow-concurrent .
@@ -229,6 +235,7 @@ seconds. The rollout stops at the first node that does not come back healthy,
 and does not start another node once
 .B ROLL_MAX
 seconds (default 4 hours) have passed.
+Settling pauses and restore polling sleeps are capped to the remaining time.
 .IP
 With
 .BR \-\-shutdown :
@@ -366,6 +373,8 @@ and
 .BR message .
 Notifications never fail a run, and are not sent during
 .BR \-\-dry-run .
+Failure messages do not expose notification URLs or tokens. JSON control
+characters in Home Assistant messages are escaped.
 Set the URLs cluster-wide with
 .B safe-power-setup \-\-ntfy
 .I URL
