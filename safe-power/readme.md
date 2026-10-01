@@ -509,7 +509,7 @@ Run them locally:
 ```bash
 sudo apt install bats shellcheck mandoc     # or: npm i -g bats
 bats safe-power/tests
-shellcheck -S warning safe-power/safe-power safe-power/safe-power-setup safe-power/tests/helper.bash
+shellcheck -S warning safe-power/safe-power safe-power/safe-power-setup safe-power/tests/*.bash
 ```
 
 > [!NOTE]

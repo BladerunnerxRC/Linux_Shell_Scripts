@@ -54,8 +54,14 @@ esac
 S
   stub kubectl <<'S'
 echo "kubectl $*" >> "$H/kubectl.log"
+# Like the API server: a cordoned node lists as Ready,SchedulingDisabled.
+case "$1" in
+  cordon)   touch "$H/cordoned-$2" ;;
+  uncordon) rm -f "$H/cordoned-$2" ;;
+esac
+self_state=Ready; [ -e "$H/cordoned-$SELF" ] && self_state=Ready,SchedulingDisabled
 case "$1 $2" in
-  "get nodes") printf 'optiplex-docker Ready cp 1d v1\noptiplex-two %s <none> 1d v1\noptiplex-three Ready <none> 1d v1\n%s Ready <none> 1d v1\n' "${TWO_STATE:-Ready}" "$SELF" ;;
+  "get nodes") printf 'optiplex-docker Ready cp 1d v1\noptiplex-two %s <none> 1d v1\noptiplex-three Ready <none> 1d v1\n%s %s <none> 1d v1\n' "${TWO_STATE:-Ready}" "$SELF" "$self_state" ;;
   "get node")  echo "$3 Ready <none> 1d v1" ;;
 esac
 exit 0

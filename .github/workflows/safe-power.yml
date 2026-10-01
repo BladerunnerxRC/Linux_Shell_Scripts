@@ -31,7 +31,7 @@ jobs:
           shellcheck -S warning \
             safe-power/safe-power \
             safe-power/safe-power-setup \
-            safe-power/tests/helper.bash
+            safe-power/tests/*.bash
 
   bats:
     name: bats tests
