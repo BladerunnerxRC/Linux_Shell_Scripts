@@ -241,7 +241,9 @@ Before draining, a node **cordons itself and then checks every other node**. If 
 -    Bring it back first, or use --allow-concurrent.
 ```
 
-This protects you from two people, or two cron jobs, taking down two workers at once. Because each node takes the lock **before** checking, two nodes that start at the same moment both back off; neither goes down. Turn it off for good with `ONE_AT_A_TIME=0` in `local.conf`, or skip it once with `--allow-concurrent`.
+Each node cordons itself **before** checking the other nodes with a consistent Kubernetes read. Competing nodes cannot both pass while both remain cordoned; either or both may back off. A failed cordon, a failed node-list request, or a read that does not confirm this node is cordoned aborts before draining. If rollback cannot uncordon the node, its drained state is kept so you can recover with `safe-power --restore`.
+
+Turn this check off for good with `ONE_AT_A_TIME=0` in `local.conf`, or skip it once with `--allow-concurrent`. Cluster shutdown skips the check because it intentionally powers off several nodes together.
 
 ### 🔔 Notifications
 
@@ -293,6 +295,18 @@ automation:
 </details>
 
 Notifications never fail a run, and are never sent during `--dry-run`.
+
+Notification failures do not print the endpoints or tokens. Home Assistant messages escape JSON control characters, including tabs and carriage returns.
+
+### Regression checks for PR1
+
+These checks stub the cluster and power commands and use temporary state files. They do not reboot or shut down a real node:
+
+```bash
+bash safe-power/tests/pr1-regressions.bash  # from the repository root
+```
+
+They cover failed cordons and node reads, rollback failures, dry-run state preservation, the concurrency override, shutdown without eviction, rollout preflight, deadline-capped sleeps, and notification encoding/redaction. Live cluster verification is still needed before deployment.
 
 ### 🩺 Reboot only when needed: `--if-needed`
 

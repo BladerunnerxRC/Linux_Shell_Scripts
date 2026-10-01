@@ -133,7 +133,18 @@ run()  { if [ "$DRY_RUN" -eq 1 ]; then log "${YLW}DRY-RUN:${RST} $*"; else "$@";
 
 # ------------------------------------------------------------ notifications
 dur() { if [ "$1" -ge 120 ]; then echo "$(( $1 / 60 )) min"; else echo "${1}s"; fi; }
-json_esc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; printf '%s' "$s"; }
+json_esc() {
+  local s=${1//\\/\\\\} i c escaped
+  s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}; s=${s//$'\b'/\\b}; s=${s//$'\f'/\\f}
+  # Bash strings cannot hold NUL; escape every other JSON control character.
+  for ((i=1; i<32; i++)); do
+    printf -v escaped '\\u%04x' "$i"
+    printf -v c '%b' "$escaped"
+    s=${s//"$c"/"$escaped"}
+  done
+  printf '%s' "$s"
+}
 
 # notify LEVEL TITLE MESSAGE — LEVEL: info|ok|warn|fail. Best effort; never fails the run.
 notify() {
@@ -148,7 +159,7 @@ notify() {
     local -a h=(-H "Title: safe-power: $title" -H "Priority: $prio" -H "Tags: $tags")
     [ -n "$NOTIFY_NTFY_TOKEN" ] && h+=(-H "Authorization: Bearer $NOTIFY_NTFY_TOKEN")
     curl -fsS -m 10 "${h[@]}" -d "[$NODE_NAME] $msg" "$NOTIFY_NTFY_URL" >/dev/null 2>&1 \
-      || warn "⚠️  ntfy notification failed ($NOTIFY_NTFY_URL)"
+      || warn "⚠️  ntfy notification failed"
   fi
   if [ -n "$NOTIFY_HA_WEBHOOK" ]; then
     curl -fsS -m 10 -H 'Content-Type: application/json' \
@@ -424,17 +435,34 @@ drain_and_power() {
     date '+%F %T'      > "$STATE_DIR/drained_at"
   fi
 
-  # 1a. One-node-down lock: cordon ourselves first, then look for any other
-  # node that is cordoned or NotReady. Two nodes racing both back off.
+  # 1a. Cordon first, then make a consistent read (resourceVersion unset).
+  # Competing nodes cannot both pass while both remain cordoned; either or
+  # both may back off. Failed writes/reads must never grant permission to drain.
+  rollback_cordon() {
+    if run kube uncordon "$NODE_NAME" --request-timeout=10s >/dev/null; then
+      [ "$DRY_RUN" -eq 1 ] || rm -f "$STATE_DIR/drained_at"
+    else
+      warn "⚠️  Could not uncordon $NODE_NAME; run safe-power --restore before retrying."
+    fi
+  }
   if [ -n "$KUBE_MODE" ] && [ "$NO_EVICT" -ne 1 ] && [ "$ONE_AT_A_TIME" -eq 1 ] && [ "$ALLOW_CONCURRENT" -ne 1 ]; then
     log "🔒 One node down at a time: cordoning $NODE_NAME, then checking the other nodes"
-    run kube cordon "$NODE_NAME" >/dev/null
-    local others
-    others=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null \
-             | awk -v me="$NODE_NAME" '$1 != me && $2 != "Ready" {print $1" ("$2")"}')
+    if ! run kube cordon "$NODE_NAME" --request-timeout=10s >/dev/null; then
+      abort "Cordon failed" "Cannot cordon $NODE_NAME. Nothing was drained or powered off; check its scheduling status before retrying."
+    fi
+    local nodes others
+    if ! nodes=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null); then
+      rollback_cordon
+      abort "Node check failed" "Cannot check the other Kubernetes nodes. Nothing was drained or powered off."
+    fi
+    if [ "$DRY_RUN" -ne 1 ] && ! awk -v me="$NODE_NAME" \
+       '$1 == me && $2 ~ /(^|,)SchedulingDisabled(,|$)/ {found=1} END {exit !found}' <<<"$nodes"; then
+      rollback_cordon
+      abort "Cordon not confirmed" "Cannot confirm $NODE_NAME is cordoned. Nothing was drained or powered off."
+    fi
+    others=$(awk -v me="$NODE_NAME" '$1 != me && $2 != "Ready" {print $1" ("$2")"}' <<<"$nodes")
     if [ -n "$others" ]; then
-      run kube uncordon "$NODE_NAME" >/dev/null
-      rm -f "$STATE_DIR/drained_at"
+      rollback_cordon
       abort "Another node is down" "Not draining $NODE_NAME: $(tr '\n' ' ' <<<"$others")is already cordoned or NotReady. Bring it back first, or use --allow-concurrent."
     fi
     ok "🔓 No other node is down"
@@ -851,7 +879,11 @@ rolling_all() {
     [[ "$(node_status "$n")" == drained* ]] && die "$n is already drained. Run: safe-power --restore $n"
   done
   if kube_detect; then
-    bad=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null | awk '$2 != "Ready" {print $1" ("$2")"}')
+    local nodes
+    nodes=$(kube get nodes --no-headers --request-timeout=10s 2>/dev/null) \
+      || abort "Rolling reboot stopped" "Cannot check Kubernetes node readiness. No nodes were rebooted."
+    [ -n "$nodes" ] || abort "Rolling reboot stopped" "Kubernetes returned no nodes. No nodes were rebooted."
+    bad=$(awk '$2 != "Ready" {print $1" ("$2")"}' <<<"$nodes")
     [ -n "$bad" ] && die "Not all nodes are Ready + schedulable: $(tr '\n' ' ' <<<"$bad")— fix or uncordon first."
     ok "✅ All Kubernetes nodes Ready and schedulable"
   else
@@ -876,7 +908,13 @@ rolling_all() {
     fi
     remote_action "$n" || abort "Rolling reboot stopped" "$n didn't come back healthy. Not started: ${order[*]:$i}"
     if [ "$i" -lt "${#order[@]}" ] && [ "$DRY_RUN" -ne 1 ]; then
-      log "😴 Letting workloads settle for ${ROLL_PAUSE}s"; sleep "$ROLL_PAUSE"
+      local pause=$ROLL_PAUSE left
+      if [ -n "${ROLL_DEADLINE:-}" ]; then
+        left=$((ROLL_DEADLINE - SECONDS))
+        [ "$left" -ge 0 ] || left=0
+        [ "$pause" -le "$left" ] || pause=$left
+      fi
+      log "😴 Letting workloads settle for ${pause}s"; sleep "$pause"
     fi
   done
   ok "🎉 Rolling reboot complete: ${order[*]}"
