@@ -213,8 +213,8 @@ subjects:
 EOF
   ok "ServiceAccount, ClusterRole, ClusterRoleBinding 'safe-power' applied"
 
-  local token="" i
-  for i in $(seq 1 30); do
+  local token=""
+  for _ in $(seq 1 30); do
     token=$(k -n "$ns" get secret safe-power-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)
     [ -n "$token" ] && break; sleep 1
   done
@@ -390,10 +390,11 @@ done
 
 # ---------------------------------------------------------------- 1. account + key
 step "1/4  Service account, passphrase-less key, sudoers on every node"
+init_files=("$SCRIPT_DIR/safe-power" "$SCRIPT_DIR/safe-power-setup" "$WORK/cluster.conf")
+[ -f "$SCRIPT_DIR/safe-power.8" ] && init_files+=("$SCRIPT_DIR/safe-power.8")
 for n in "${NODES[@]}"; do
   echo "  ${BLD}$n${RST}"
-  push "$n" "$SCRIPT_DIR/safe-power" "$SCRIPT_DIR/safe-power-setup" "$WORK/cluster.conf" \
-       $( [ -f "$SCRIPT_DIR/safe-power.8" ] && echo "$SCRIPT_DIR/safe-power.8" )
+  push "$n" "${init_files[@]}"
   as_root "$n" bash "${STAGE[$n]}/safe-power-setup" --node-init "${STAGE[$n]}" || die "node setup failed on $n"
 done
 

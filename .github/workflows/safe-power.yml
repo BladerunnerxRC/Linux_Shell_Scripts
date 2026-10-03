@@ -1,0 +1,56 @@
+name: safe-power
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "safe-power/**"
+      - ".github/workflows/safe-power.yml"
+  pull_request:
+    paths:
+      - "safe-power/**"
+      - ".github/workflows/safe-power.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safe-power-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -S warning \
+            safe-power/safe-power \
+            safe-power/safe-power-setup \
+            safe-power/tests/*.bash
+
+  bats:
+    name: bats tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+      - name: Run tests
+        # Every external command (docker, kubectl, ssh, systemctl, curl, ...) is
+        # stubbed by tests/helper.bash; nothing touches the runner's real services.
+        run: bats --version && bats --print-output-on-failure safe-power/tests
+
+  manpage:
+    name: man page lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mandoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mandoc
+      - name: mandoc -T lint
+        run: mandoc -T lint -W warning safe-power/safe-power.8

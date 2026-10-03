@@ -1,5 +1,6 @@
 # ⚡ safe-power
 
+[![safe-power CI](https://github.com/BladerunnerxRC/Linux_Shell_Scripts/actions/workflows/safe-power.yml/badge.svg)](https://github.com/BladerunnerxRC/Linux_Shell_Scripts/actions/workflows/safe-power.yml)
 ![bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)
 ![kubernetes](https://img.shields.io/badge/kubernetes-drain%20%2F%20uncordon-326CE5?logo=kubernetes&logoColor=white)
 ![docker](https://img.shields.io/badge/docker-tiered%20shutdown-2496ED?logo=docker&logoColor=white)
@@ -493,11 +494,33 @@ DB_STOP_TIMEOUT=180
 
 ---
 
+## 🧪 Tests
+
+Every pull request, and every push to `main`, that touches `safe-power/` runs three checks in GitHub Actions ([workflow](../.github/workflows/safe-power.yml)):
+
+| Job | What |
+|---|---|
+| ✅ **shellcheck** | `shellcheck -S warning` on both scripts and the test helper |
+| ✅ **bats tests** | 56 tests: CLI parsing, the SSH gate (allow and reject), backup detection, container tiers, the one-node lock, notifications (including valid Home Assistant JSON), `--all` order and banner, `--shutdown --all`, the time limit, `--if-needed`, `--at` / `--cancel`, required mounts |
+| ✅ **man page** | `mandoc -T lint` |
+
+Run them locally:
+
+```bash
+sudo apt install bats shellcheck mandoc     # or: npm i -g bats
+bats safe-power/tests
+shellcheck -S warning safe-power/safe-power safe-power/safe-power-setup safe-power/tests/*.bash
+```
+
+> [!NOTE]
+> The tests never touch a real cluster. `tests/helper.bash` builds a test copy of `safe-power` that uses temporary conf, state and log paths, and puts stubs for `ssh`, `kubectl`, `docker`, `systemctl`, `systemd-run`, `curl`, `sudo`, `findmnt` and `mount` first in `PATH`. It's safe to run on a node, a laptop or a CI runner, as a normal user.
+
+---
+
 ## 🗺️ Roadmap
 
 | | Idea | Why |
 |---|---|---|
-| 🧪 | **shellcheck + bats tests** in GitHub Actions | Catch regressions before they reach the cluster |
 | 📖 | **Merge the v1 `COMMAND_scripts/safe-power`** once smiddleware moves to v2 | One `safe-power` command on every host |
 
 See `man safe-power` for the full reference.
