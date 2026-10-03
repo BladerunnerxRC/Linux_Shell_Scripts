@@ -159,6 +159,21 @@ Runs at the next boot, or when started with
 .BR \-\-restore :
 .RS
 .IP \(bu 2
+Waits up to
+.B MOUNT_WAIT
+seconds for each path in
+.B REQUIRED_MOUNTS
+(for example the NFS backup share), and tries
+.B mount
+once. This happens
+.B before
+any container starts, so nothing writes into an empty mount point on the local
+disk. If a mount is still missing, the restore stops right there: no containers
+start, the node stays cordoned and drained, \fB\-\-status\fP reports it as failed,
+and a notification is sent. The next boot retries, or run
+.B safe-power \-\-restore
+after fixing the mount.
+.IP \(bu 2
 Sets the Swarm node active again.
 .IP \(bu 2
 Starts the containers that were running, tier by tier in reverse (infra,
@@ -202,9 +217,31 @@ or
 .B \-\-check
 Checks the node's setup:
 .BR cluster.conf ,
-the service account, its SSH key, the sudoers rule,
+the service account, its SSH key, the sudoers rule, whether the trusted keys
+are limited by
+.BR from= ,
+the required mounts,
 .B kubectl
 access, and SSH access to every other node.
+.TP
+.B \-\-needs-reboot
+Prints
+.BI "yes: " reason
+(exit 0) or
+.B no
+(exit 1). A node needs a reboot when
+.B /var/run/reboot-required
+exists (Debian/Ubuntu),
+.B "needs-restarting \-r"
+says so (RHEL/Fedora), or a newer kernel is installed in
+.B /boot
+than the one running. With
+.BR \-\-all :
+a table for every node.
+.TP
+.B \-\-cancel
+Cancels every run on this node that was scheduled with
+.BR \-\-at .
 .SH OPTIONS
 .TP
 .I NODE
@@ -273,6 +310,41 @@ the time limit for the rollout (overrides
 .B \-\-allow-concurrent
 Skip the one-node-down lock.
 .TP
+.B \-\-if-needed
+With
+.BR \-\-reboot :
+reboot only if the node needs it (see
+.BR \-\-needs-reboot ).
+With
+.BR \-\-all ,
+the rollout first asks every node and reboots only those that need it. A nightly
+.B "\-\-reboot \-\-all \-\-if-needed"
+therefore reboots nothing on most nights.
+.TP
+.BI \-\-at " WHEN"
+Run the same command later instead of now, as a one-shot systemd timer
+.RB ( safe-power-at-* ).
+.I WHEN
+is anything
+.BR date (1)
+understands:
+.BR 03:00 ,
+.BR "tomorrow 02:30" ,
+.BR "2026-10-03 04:00" .
+A bare time that has already passed today means tomorrow. The confirmation
+(including the red warning for
+.BR \-\-all )
+happens now, and the scheduled run gets
+.BR \-y .
+The timer lives on the node where you ran the command, so a reboot of that node
+before
+.I WHEN
+cancels it.
+.B \-\-status
+lists scheduled runs, and
+.B \-\-cancel
+removes them.
+.TP
 .BR \-y ", " \-\-yes
 Do not ask for confirmation.
 .TP
@@ -320,10 +392,13 @@ as root;
 adds every node's key to
 .BR authorized_keys ,
 each with
-.B restrict
-and the forced command
+.BR restrict ,
+the forced command
 .BR "safe-power \-\-ssh-gate" ,
-and records every node's host key in
+and
+.B from="\fIthat node's addresses\fP"
+so a copied key is useless from any other machine. Records every node's host
+key in
 .BR known_hosts .
 .PP
 On the control plane it also creates the Kubernetes ServiceAccount
@@ -340,7 +415,21 @@ Options:
 .BI \-\-ntfy " URL" ,
 .BI \-\-ntfy-token " TOKEN" ,
 .BI \-\-ha-webhook " URL" ,
+.BR \-\-no-from / \-\-from ,
+.BI \-\-from-extra " LIST" ,
 .BR \-\-verify .
+.PP
+The addresses for
+.B from=
+are the node's global IP addresses at setup time
+.RB ( /etc/safe-power/safepower.addrs ).
+If a node's IP changes, re-run
+.BR safe-power-setup .
+Use
+.B \-\-from-extra
+for a VPN or NAT range, or
+.B \-\-no-from
+to turn the limit off.
 .SH NOTIFICATIONS
 If
 .B NOTIFY_NTFY_URL
@@ -432,6 +521,18 @@ Drain, restore and rollout timing.
 .B ONE_AT_A_TIME
 1 (default) refuses to drain while another node is down.
 .TP
+.B REQUIRED_MOUNTS, MOUNT_WAIT
+Mount points that must be up after boot, before containers start, for example
+.BR "REQUIRED_MOUNTS=(\(dq/mnt/nas_backups\(dq)" .
+Set per node in
+.BR local.conf .
+.TP
+.B REBOOT_REQUIRED_FILE, BOOT_DIR
+Used by
+.B \-\-if-needed
+and
+.BR \-\-needs-reboot .
+.TP
 .B NOTIFY_NTFY_URL, NOTIFY_NTFY_TOKEN, NOTIFY_HA_WEBHOOK
 Notifications.
 .TP
@@ -514,6 +615,12 @@ Reboot tonight even if a backup is running, after waiting for it to finish:
 .TP
 Rolling reboot of the whole cluster:
 .B safe-power \-\-reboot \-\-all
+.TP
+Tonight at 03:00, reboot only the nodes with pending updates:
+.B safe-power \-\-reboot \-\-all \-\-if-needed \-\-at 03:00
+.TP
+Which nodes need a reboot?
+.B safe-power \-\-needs-reboot \-\-all
 .TP
 Rolling reboot of the workers only, with a 2-hour limit:
 .B safe-power \-\-reboot \-\-all \-\-workers-only \-\-max-time=120
