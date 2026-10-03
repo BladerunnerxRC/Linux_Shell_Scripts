@@ -9,8 +9,9 @@ safe-power \- drain, reboot or shut down a Kubernetes/Docker node safely, and re
 .RI [ options ]
 .br
 .B safe-power
-.RB { \-\-reboot | \-\-status | \-\-check }
+.RB { \-\-reboot | \-\-shutdown | \-\-status | \-\-check }
 .B \-\-all
+.RB [ \-\-workers-only ]
 .RI [ options ]
 .br
 .B safe-power-setup
@@ -105,7 +106,22 @@ is an app. The container label
 overrides the guess.
 .TP
 .B 4. Kubernetes drain
-Runs
+First it takes the one-node-down lock: the node cordons itself, then checks
+whether any other node is cordoned or
+.BR NotReady .
+If one is, it uncordons itself and aborts. The read requests the most recent
+Kubernetes state. Competing nodes cannot both pass while both remain
+cordoned; either or both may back off. A failed cordon or node-list request,
+or a read that does not confirm this node is cordoned, aborts before drain.
+If rollback cannot uncordon the node, its drained state is kept for recovery
+with
+.BR \-\-restore .
+Turn this check off with
+.B ONE_AT_A_TIME=0
+or skip it once with
+.BR \-\-allow-concurrent .
+.IP
+Then it runs
 .B kubectl drain
 .I NODE
 .BR "\-\-ignore-daemonsets \-\-delete-emptydir-data" .
@@ -114,6 +130,11 @@ pod), the node is uncordoned and the run aborts without powering off. A worker
 with no
 .B kubectl
 access refuses to continue.
+.IP
+During a cluster shutdown
+.RB ( "\-\-shutdown \-\-all" )
+the node is only cordoned: pods are not evicted because there is nowhere for
+them to go, and there is no lock check.
 .TP
 .B 5. Docker shutdown
 Drains the Swarm node if Swarm is active. Then it stops the local containers
@@ -210,12 +231,47 @@ and schedulable. Then it reboots the other workers, then the control plane,
 then this node last. Each node must report ok before the next one starts,
 followed by a pause of
 .B ROLL_PAUSE
-seconds. The rollout stops at the first node that does not come back healthy.
+seconds. The rollout stops at the first node that does not come back healthy,
+and does not start another node once
+.B ROLL_MAX
+seconds (default 4 hours) have passed.
+Settling pauses and restore polling sleeps are capped to the remaining time.
+.IP
+With
+.BR \-\-shutdown :
+a cluster power-off, for a UPS or a power outage. The other workers are shut
+down in parallel, then the control plane, then this node. Nodes are cordoned
+but not drained. A node that is unreachable (probably already off) is skipped,
+and a node that fails does not stop the others. For unattended use, add
+.BR "\-y \-\-ignore-backups" .
+.IP
 With
 .B \-\-status
 or
 .BR \-\-check ,
 the action runs on every node.
+.IP
+Before a reboot or shutdown of the whole cluster,
+.B safe-power
+shows a blinking red warning that lists the nodes, and asks you to type
+.BR yes .
+.B \-y
+skips the question but still shows the warning.
+.TP
+.B \-\-workers-only
+With
+.BR \-\-all :
+leave the control plane out.
+.TP
+.BI \-\-max-time= MINUTES
+With
+.BR "\-\-reboot \-\-all" :
+the time limit for the rollout (overrides
+.BR ROLL_MAX ;
+0 means no limit).
+.TP
+.B \-\-allow-concurrent
+Skip the one-node-down lock.
 .TP
 .BR \-y ", " \-\-yes
 Do not ask for confirmation.
@@ -281,7 +337,56 @@ Options:
 .BI \-\-admin " USER" ,
 .BI \-\-user " NAME" ,
 .BI \-\-api-server " URL" ,
+.BI \-\-ntfy " URL" ,
+.BI \-\-ntfy-token " TOKEN" ,
+.BI \-\-ha-webhook " URL" ,
 .BR \-\-verify .
+.SH NOTIFICATIONS
+If
+.B NOTIFY_NTFY_URL
+or
+.B NOTIFY_HA_WEBHOOK
+is set,
+.B safe-power
+sends a notification when:
+.IP \(bu 2
+a node reboots, powers off or is drained;
+.IP \(bu 2
+a restore succeeds or fails;
+.IP \(bu 2
+a run is aborted (a backup is running, the drain failed, or another node is
+down);
+.IP \(bu 2
+a rolling reboot or cluster shutdown starts, finishes or stops.
+.PP
+.B ntfy
+gets a plain-text message with a title and a priority (urgent for failures).
+.B NOTIFY_NTFY_TOKEN
+adds a bearer token.
+.B "Home Assistant"
+gets a JSON POST to the webhook with the fields
+.BR node ,
+.B level
+.RB ( info | ok | warn | fail ),
+.B title
+and
+.BR message .
+Notifications never fail a run, and are not sent during
+.BR \-\-dry-run .
+Failure messages do not expose notification URLs or tokens. JSON control
+characters in Home Assistant messages are escaped.
+Set the URLs cluster-wide with
+.B safe-power-setup \-\-ntfy
+.I URL
+and
+.B \-\-ha-webhook
+.IR URL .
+.BR \-\-ntfy-token
+.IR TOKEN .
+These settings are kept in
+.BR /etc/safe-power/notify.conf ,
+which is root-only (0600) on every node, because a webhook URL or ntfy topic
+works like a password.
 .SH SECURITY
 The service account cannot open a shell. The SSH gate
 .RB ( "safe-power \-\-ssh-gate" )
@@ -321,8 +426,14 @@ Container tiers.
 .B STOP_TIMEOUT, DB_STOP_TIMEOUT, HEALTH_WAIT
 Container stop and start timing.
 .TP
-.B DRAIN_TIMEOUT, CONVERGE_TIMEOUT, ROLL_PAUSE
+.B DRAIN_TIMEOUT, CONVERGE_TIMEOUT, ROLL_PAUSE, ROLL_MAX
 Drain, restore and rollout timing.
+.TP
+.B ONE_AT_A_TIME
+1 (default) refuses to drain while another node is down.
+.TP
+.B NOTIFY_NTFY_URL, NOTIFY_NTFY_TOKEN, NOTIFY_HA_WEBHOOK
+Notifications.
 .TP
 .B HEALTH_URLS
 URLs that must answer 2xx/3xx after a restore (control plane only).
@@ -351,8 +462,12 @@ State:
 Cluster layout. Identical on every node, and rewritten by
 .BR safe-power-setup .
 .TP
+.B /etc/safe-power/notify.conf
+Notification URLs and ntfy token (root-only, 0600). Rewritten by
+.BR safe-power-setup .
+.TP
 .B /etc/safe-power/local.conf
-Per-node overrides, for example
+Per-node overrides (root-only, 0600), for example
 .BR HEALTH_URLS ,
 .B BLOCKING_CONTAINERS
 or
@@ -377,8 +492,9 @@ Present only while a node is drained.
 Success.
 .TP
 .B 1
-Aborted (a backup was running, apt was busy, the drain failed, or the user
-declined), or the restore finished with problems.
+Aborted (a backup was running, apt was busy, another node was down, the drain
+failed, the time limit was reached, or the user declined), or the restore
+finished with problems.
 .TP
 .B 2
 Usage error.
@@ -398,6 +514,16 @@ Reboot tonight even if a backup is running, after waiting for it to finish:
 .TP
 Rolling reboot of the whole cluster:
 .B safe-power \-\-reboot \-\-all
+.TP
+Rolling reboot of the workers only, with a 2-hour limit:
+.B safe-power \-\-reboot \-\-all \-\-workers-only \-\-max-time=120
+.TP
+Power off the whole cluster from a UPS (NUT
+.BR SHUTDOWNCMD ):
+.B /usr/local/sbin/safe-power \-\-shutdown \-\-all \-y \-\-ignore-backups
+.TP
+Turn on phone notifications for every node:
+.B safe-power-setup \-\-ntfy https://ntfy.sh/my-cluster
 .TP
 See every node's state:
 .B safe-power \-\-status \-\-all
